@@ -361,6 +361,88 @@ test('provider errors preserve safe diagnostics without leaking response text or
     assert.equal(result.status,409);assert.equal((await result.json()).code,'PIX_UNCERTAIN');
   } finally {globalThis.fetch=old;console.log=oldLog}
 });
+test('Sigilo generates a PIX with server credentials, and authenticated status confirms payment',async()=>{
+  const env=makeEnv(),old=globalThis.fetch,calls=[];
+  env.SIGILO_PUBLIC_KEY='test-public';env.SIGILO_SECRET_KEY='test-secret';env.PUBLIC_WORKER_URL='https://worker.example';
+  env.testRecords.set('gateway-routing-v2:policy',{active:'sigilo',startedAt:Date.now(),assessedThrough:null});
+  const router=env.PIX_REQUESTS.get(env.PIX_REQUESTS.idFromName('gateway-routing-v2'));
+  let chosen;
+  for(let n=0;n<100 && !chosen;n++){const candidate='b91c47d9-3284-4baa-981f-'+n.toString(16).padStart(12,'0');const result=await router.fetch('https://worker.internal/gateway/select',{method:'POST',body:JSON.stringify({requestId:candidate})});if((await result.json()).gateway==='sigilo')chosen=candidate;}
+  assert.ok(chosen);const input=sale();input.requestId=chosen;
+  globalThis.fetch=async(url,init)=>{calls.push({url:String(url),init});if(String(url).includes('/pix/receive'))return Response.json({transactionId:'sigilo-1',status:'OK',webhookToken:'hook-token',pix:{code:'000201-sigilo'}});if(String(url).includes('/transactions'))return Response.json({id:'sigilo-1',clientIdentifier:chosen,paymentMethod:'PIX',status:'COMPLETED',amount:27.99});throw Error('Unexpected provider')};
+  try {const created=await worker.fetch(req('/api/pix',input),env);assert.equal(created.status,201);assert.equal((await created.json()).paymentData.copyPaste,'000201-sigilo');
+    const sent=JSON.parse(calls[0].init.body);assert.equal(calls[0].init.headers['x-secret-key'],'test-secret');assert.equal(sent.identifier,chosen);assert.equal(sent.amount,27.99);assert.equal(sent.callbackUrl,'https://worker.example/api/sigilo/webhook');
+    const status=await worker.fetch(req('/api/pix/status',{requestId:chosen}),env);assert.deepEqual(await status.json(),{status:'PAID',amount:2799});
+    assert.equal(env.testRecords.get(chosen+':sale').gateway,'sigilo');
+    assert.equal(env.testRecords.get('gateway-routing-v2:g:'+chosen).paid,true);
+  } finally {globalThis.fetch=old}
+});
+test('a Blackcat 500 falls back to Sigilo and returns its PIX',async()=>{
+  const env=makeEnv(),old=globalThis.fetch,calls=[];env.SIGILO_PUBLIC_KEY='test-public';env.SIGILO_SECRET_KEY='test-secret';env.PUBLIC_WORKER_URL='https://worker.example';
+  const router=env.PIX_REQUESTS.get(env.PIX_REQUESTS.idFromName('gateway-routing-v2'));let chosen;
+  for(let n=0;n<100 && !chosen;n++){const candidate='b91c47d9-3284-4baa-981f-'+n.toString(16).padStart(12,'0');const result=await router.fetch('https://worker.internal/gateway/select',{method:'POST',body:JSON.stringify({requestId:candidate})});if((await result.json()).gateway==='blackcat')chosen=candidate;}
+  const input=sale();input.requestId=chosen;
+  globalThis.fetch=async url=>{calls.push(String(url));return String(url).includes('blackcatoficial')?Response.json({success:false},{status:500}):Response.json({transactionId:'sigilo-after-500',status:'OK',webhookToken:'hook',pix:{code:'000201-after-500'}})};
+  try {const created=await worker.fetch(req('/api/pix',input),env);assert.equal(created.status,201);assert.equal((await created.json()).paymentData.copyPaste,'000201-after-500');assert.equal(calls.length,2);assert.match(calls[0],/blackcatoficial/);assert.match(calls[1],/sigilopay/);assert.equal((await worker.fetch(req('/api/pix/recover',{requestId:chosen}),env)).status,200);} finally {globalThis.fetch=old}
+});
+test('a definitive Blackcat validation rejection falls back to Sigilo on the same order ID',async()=>{
+  const env=makeEnv(),old=globalThis.fetch,calls=[];env.SIGILO_PUBLIC_KEY='test-public';env.SIGILO_SECRET_KEY='test-secret';env.PUBLIC_WORKER_URL='https://worker.example';
+  const router=env.PIX_REQUESTS.get(env.PIX_REQUESTS.idFromName('gateway-routing-v2'));let chosen;
+  for(let n=0;n<100 && !chosen;n++){const candidate='b91c47d9-3284-4baa-981f-'+n.toString(16).padStart(12,'0');const result=await router.fetch('https://worker.internal/gateway/select',{method:'POST',body:JSON.stringify({requestId:candidate})});if((await result.json()).gateway==='blackcat')chosen=candidate;}
+  const input=sale();input.requestId=chosen;
+  globalThis.fetch=async(url,init)=>{calls.push({url:String(url),init});return String(url).includes('blackcat')?Response.json({success:false,message:'invalid'},{status:422}):Response.json({transactionId:'sigilo-fallback',status:'OK',webhookToken:'hook-token',pix:{code:'000201-fallback'}})};
+  try {const created=await worker.fetch(req('/api/pix',input),env);assert.equal(created.status,201);assert.equal((await created.json()).paymentData.copyPaste,'000201-fallback');assert.equal(calls.length,2);assert.equal(JSON.parse(calls[1].init.body).identifier,chosen);assert.equal(env.testRecords.get(chosen+':sale').gateway,'sigilo');} finally {globalThis.fetch=old}
+});
+test('a Sigilo rejection falls back to Blackcat',async()=>{
+  const env=makeEnv(),old=globalThis.fetch,calls=[];env.SIGILO_PUBLIC_KEY='test-public';env.SIGILO_SECRET_KEY='test-secret';env.PUBLIC_WORKER_URL='https://worker.example';
+  env.testRecords.set('gateway-routing-v2:policy',{active:'sigilo',startedAt:Date.now(),assessedThrough:null});
+  const router=env.PIX_REQUESTS.get(env.PIX_REQUESTS.idFromName('gateway-routing-v2'));let chosen;
+  for(let n=0;n<100 && !chosen;n++){const candidate='b91c47d9-3284-4baa-981f-'+n.toString(16).padStart(12,'0');const result=await router.fetch('https://worker.internal/gateway/select',{method:'POST',body:JSON.stringify({requestId:candidate})});if((await result.json()).gateway==='sigilo')chosen=candidate;}
+  const input=sale();input.requestId=chosen;
+  globalThis.fetch=async url=>{calls.push(String(url));return String(url).includes('/pix/receive')?Response.json({statusCode:422,errorCode:'VALIDATION',message:'invalid'},{status:422}):String(url).includes('/transactions')?Response.json({error:'missing'},{status:404}):Response.json(response())};
+  try {const created=await worker.fetch(req('/api/pix',input),env);assert.equal(created.status,201);assert.equal((await created.json()).paymentData.copyPaste,'000201-test');assert.equal(calls.length,3);assert.equal(env.testRecords.get(chosen+':sale').gateway,'blackcat');} finally {globalThis.fetch=old}
+});
+test('routing sends every new order to the active gateway and checks non-overlapping groups of ten mature PIX',async()=>{
+  const env=makeEnv(),router=env.PIX_REQUESTS.get(env.PIX_REQUESTS.idFromName('gateway-routing-v2'));
+  const pick=async requestId=>(await (await router.fetch('https://worker.internal/gateway/select',{method:'POST',body:JSON.stringify({requestId})})).json()).gateway;
+  assert.equal(await pick(id),'blackcat');
+  const now=Date.now();
+  for(let n=0;n<9;n++)env.testRecords.set('gateway-routing-v2:g:a'+n,{gateway:'blackcat',createdAt:now-601000+n,paid:n<1});
+  assert.equal(await pick(id),'blackcat');
+  env.testRecords.set('gateway-routing-v2:g:a9',{gateway:'blackcat',createdAt:now-599000,paid:false});
+  assert.equal(await pick(id),'blackcat');
+  env.testRecords.set('gateway-routing-v2:g:a9',{gateway:'blackcat',createdAt:now-601000+9,paid:false});
+  assert.equal(await pick(id),'sigilo');
+  assert.equal(await pick('123e4567-e89b-42d3-a456-426614174000'),'sigilo');
+  const switched=env.testRecords.get('gateway-routing-v2:policy');assert.equal(switched.active,'sigilo');
+  // Simulate the next review after this gateway has been active for ten minutes.
+  env.testRecords.set('gateway-routing-v2:policy',{...switched,startedAt:now-602000});
+  for(let n=0;n<10;n++)env.testRecords.set('gateway-routing-v2:g:b'+n,{gateway:'sigilo',createdAt:now-601000+n,paid:n<2});
+  assert.equal(await pick(id),'sigilo');
+  assert.ok(env.testRecords.get('gateway-routing-v2:policy').assessedThrough);
+  for(let n=0;n<9;n++)env.testRecords.set('gateway-routing-v2:g:c'+n,{gateway:'sigilo',createdAt:now-600900+n,paid:n<1});
+  assert.equal(await pick(id),'sigilo');
+  env.testRecords.set('gateway-routing-v2:g:c9',{gateway:'sigilo',createdAt:now-600891,paid:false});
+  assert.equal(await pick(id),'blackcat');
+});
+test('Sigilo webhook requires its per-transaction token and confirms status with Sigilo',async()=>{
+  const env=makeEnv(),old=globalThis.fetch;
+  env.SIGILO_PUBLIC_KEY='test-public';env.SIGILO_SECRET_KEY='test-secret';env.PUBLIC_WORKER_URL='https://worker.example';
+  env.testRecords.set('gateway-routing-v2:policy',{active:'sigilo',startedAt:Date.now(),assessedThrough:null});
+  const router=env.PIX_REQUESTS.get(env.PIX_REQUESTS.idFromName('gateway-routing-v2'));let chosen;
+  for(let n=0;n<100 && !chosen;n++){const candidate='b91c47d9-3284-4baa-981f-'+n.toString(16).padStart(12,'0');const result=await router.fetch('https://worker.internal/gateway/select',{method:'POST',body:JSON.stringify({requestId:candidate})});if((await result.json()).gateway==='sigilo')chosen=candidate;}
+  const input=sale();input.requestId=chosen;
+  globalThis.fetch=async url=>String(url).includes('/pix/receive')?Response.json({transactionId:'sigilo-1',status:'OK',webhookToken:'secret-hook',pix:{code:'000201-sigilo'}}):Response.json({id:'sigilo-1',clientIdentifier:chosen,paymentMethod:'PIX',status:'COMPLETED',amount:27.99});
+  try {
+    assert.equal((await worker.fetch(req('/api/pix',input),env)).status,201);
+    const payload={event:'TRANSACTION_PAID',token:'wrong',transaction:{id:'sigilo-1',identifier:chosen,status:'COMPLETED',paymentMethod:'PIX'}};
+    const send=()=>worker.fetch(req('/api/sigilo/webhook',payload),env);
+    assert.equal((await send()).status,403);
+    payload.token='secret-hook';assert.equal((await send()).status,200);
+    assert.equal(env.testRecords.get(chosen+':sale').response.status,'PAID');
+    assert.equal(env.testRecords.get('gateway-routing-v2:g:'+chosen).paid,true);
+  } finally {globalThis.fetch=old}
+});
 test('order customizations are bounded, included in metadata and not retained by the durable object',async()=>{
   const env=makeEnv(), old=globalThis.fetch; let sent;
   globalThis.fetch=async(url,init)=>{sent=JSON.parse(init.body);return Response.json(response())};

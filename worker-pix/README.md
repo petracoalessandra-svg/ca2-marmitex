@@ -1,5 +1,15 @@
 # Worker PIX
 
+## Dois gateways e seleção automática
+
+O Worker usa Blackcat e Sigilo Pay sem mudar o contrato do frontend. A Sigilo exige `SIGILO_PUBLIC_KEY` e `SIGILO_SECRET_KEY` como secrets do Worker; configure-os diretamente na Cloudflare. A chave privada não deve entrar no código, no Git ou no navegador. `PUBLIC_WORKER_URL` aponta para a URL pública deste Worker e define o callback `POST /api/sigilo/webhook`. Configure as credenciais antes de publicar. As cobranças antigas permanecem vinculadas ao gateway em que foram criadas.
+
+Para novos pedidos, o Durable Object `gateway-routing-v2` em `PIX_REQUESTS` mantém um gateway ativo. Inicialmente é a Blackcat; todos os novos pedidos tentam esse gateway primeiro. O outro só recebe um pedido se houver fallback durante a geração. O seletor é reavaliado na chegada de cada pedido novo, sem tarefa periódica. Ele considera somente PIX gerados com código pelo gateway ativo, com pelo menos 10 minutos e menos de 24 horas, ainda não usados em avaliação. A cada lote fechado de 10 PIX elegíveis, calcula pagamentos confirmados / 10: com 0 ou 1 pago (menos de 20%), alterna o gateway ativo; com 2 ou mais pagos, mantém o atual e passa ao próximo lote. Cada PIX entra em apenas um lote. Depois da troca, a contagem do novo gateway começa com os PIX gerados desde a ativação. Webhooks e consultas autenticadas atualizam as confirmações; sem consulta ou webhook, a taxa observada pode ficar defasada. Os registros com mais de 24 horas são removidos nas avaliações seguintes. Cobranças anteriores preservam seu gateway, mesmo após uma troca.
+
+Se a geração não entregar um PIX utilizável, inclusive em HTTP 500 ou timeout, o Worker tenta o outro gateway com o mesmo identificador do pedido e retorna o código que conseguir gerar. Isso evita mostrar o erro intermediário ao cliente, mas **pode criar duas cobranças** se o primeiro gateway tiver criado uma transação apesar da falha na resposta. A documentação da Blackcat não oferece consulta por `externalRef` para eliminar essa incerteza. Verifique reconciliação e possíveis cobranças duplicadas em ambos os painéis antes de ativar. Se os dois gateways falharem, o Worker mantém a tentativa como incerta e não cria uma terceira cobrança.
+
+Os testes locais usam credenciais fictícias e não geram cobranças reais. Antes de publicar, confira os bindings `PIX_REQUESTS`, `PAYMENT_SESSIONS`, rate limiters, secrets, webhook da Blackcat e o callback da Sigilo no Worker de destino. Publique manualmente `worker.mjs` com `wrangler.toml` compatível; copiar apenas o código não cria secrets ou bindings.
+
 ## Cadastro do pet no Supabase
 
 Antes do deploy manual, execute `worker-pix/supabase-pet-registrations.sql` no SQL Editor do projeto Supabase. O arquivo cria `public.pet_registrations` com identificação, nome, validade da vacinação, código, identificação da carteira de vacina, endereço de cobrança e parcelamento. A tabela tem RLS ativo e não permite acesso direto pelos papéis públicos.

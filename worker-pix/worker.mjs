@@ -29,6 +29,26 @@ export const PRICES = Object.freeze({
 // END GENERATED PRICES
 
 const API = 'https://api.blackcatoficial.com/api/sales/create-sale';
+const SIGILO_API = 'https://app.sigilopay.com.br/api/v1/gateway';
+const GATEWAY_STATS = 'gateway-routing-v2';
+const sigiloHeaders = env => ({'x-public-key':env.SIGILO_PUBLIC_KEY,'x-secret-key':env.SIGILO_SECRET_KEY});
+function sigiloStatus(value) { return ({PENDING:'PENDING',COMPLETED:'PAID',FAILED:'CANCELLED',EXPIRED:'CANCELLED',REFUNDED:'REFUNDED',CHARGED_BACK:'REFUNDED'})[value] || null; }
+function routingObject(env) { return env.PIX_REQUESTS.get(env.PIX_REQUESTS.idFromName(GATEWAY_STATS)); }
+async function routingCall(env,path,body) {
+  const result=await routingObject(env).fetch('https://worker.internal/gateway/'+path,{method:'POST',body:JSON.stringify(body)});
+  if (!result.ok) throw Error('Gateway routing unavailable');
+  return result.json();
+}
+async function sigiloQuery(env,identifier) {
+  const url=new URL(SIGILO_API+'/transactions');url.searchParams.set('clientIdentifier',identifier);
+  const response=await fetch(url,{headers:sigiloHeaders(env),signal:AbortSignal.timeout(8000)});
+  if (response.status===404) throw Error('Sigilo not found');
+  if (!response.ok) throw Error('Sigilo status unavailable');
+  const body=await response.json();
+  const data=Array.isArray(body) ? body.find(item=>item.clientIdentifier===identifier) : Array.isArray(body?.data) ? body.data.find(item=>item.clientIdentifier===identifier) : body?.data || body;
+  if (!data || data.clientIdentifier!==identifier || data.paymentMethod!=='PIX') throw Error('Sigilo status mismatch');
+  return data;
+}
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const json = (data, status = 200, headers = {}) => new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'Referrer-Policy':'no-referrer', ...headers } });
 const SESSION_TTL = 86400000;
@@ -231,10 +251,22 @@ async function blackcatWebhook(request, env) {
     return await object.fetch('https://worker.internal/webhook',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({transactionId:body.transactionId,requestId:body.externalReference.toLowerCase()})});
   } catch (_) { return json({error:'Serviço indisponível.'},503); }
 }
+async function sigiloWebhook(request,env) {
+  if(request.method!=='POST' || !env.SIGILO_SECRET_KEY || !env.PIX_REQUESTS) return json({error:'Indisponível'},503);
+  let body;
+  try {const raw=await request.text();if(new TextEncoder().encode(raw).length>16384)return json({error:'Muito grande'},413);body=JSON.parse(raw);} catch (_) {return json({error:'Inválido'},400);}
+  const transaction=body?.transaction;
+  if(body?.event!=='TRANSACTION_PAID' || !UUID.test(transaction?.identifier||'') || transaction?.status!=='COMPLETED' || transaction?.paymentMethod!=='PIX' || typeof body.token!=='string') return json({error:'Inválido'},400);
+  try {
+    const object=env.PIX_REQUESTS.get(env.PIX_REQUESTS.idFromName(transaction.identifier.toLowerCase()));
+    return object.fetch('https://worker.internal/sigilo-paid',{method:'POST',body:JSON.stringify({requestId:transaction.identifier,transactionId:transaction.id,token:body.token})});
+  } catch (_) {return json({error:'Indisponível'},503);}
+}
 
 export default {
   async fetch(request, env) {
     if (new URL(request.url).pathname === '/api/blackcat/webhook') return blackcatWebhook(request, env);
+    if (new URL(request.url).pathname === '/api/sigilo/webhook') return sigiloWebhook(request, env);
     const origin = allowedOrigin(request, env);
     if (!origin) return json({ error: 'Origem não autorizada.' }, 403);
     const cors = { 'Access-Control-Allow-Origin': origin, 'Vary': 'Origin', 'Access-Control-Allow-Methods': 'POST, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type' };
@@ -262,7 +294,7 @@ export default {
       if (path === '/api/pix') sale = saleFromInput(body);
       else if (!body || !UUID.test(body.requestId || '')) throw Error('Solicitação inválida.');
     } catch (error) { return json({ error: error instanceof SyntaxError ? 'JSON inválido.' : error.message }, 400, cors); }
-    if (!env.BLACKCAT_API_KEY || !env.PIX_REQUESTS) return json({ error: 'Pagamento ainda não configurado.' }, 503, cors);
+    if (!env.PIX_REQUESTS || (!env.BLACKCAT_API_KEY && !env.SIGILO_SECRET_KEY)) return json({ error: 'Pagamento ainda não configurado.' }, 503, cors);
     const object = env.PIX_REQUESTS.get(env.PIX_REQUESTS.idFromName(body.requestId.toLowerCase()));
     try {
       const route = path === '/api/pix' ? 'create' : path === '/api/pix/status' ? 'status' : 'recover';
@@ -315,7 +347,52 @@ export class PixRequest {
   }
   async fetch(request) {
     if (request.method !== 'POST') return json({ error: 'Não encontrado.' }, 404);
+    if (new URL(request.url).pathname.startsWith('/gateway/')) {
+      const path=new URL(request.url).pathname, input=await request.json();
+      if (path==='/gateway/select') {
+        const active=await this.state.storage.transaction(async tx=>{
+          const now=Date.now();
+          const policy=await tx.get('policy') || {active:'blackcat',startedAt:0,assessedThrough:null};
+          const records=await tx.list({prefix:'g:'});
+          for(const [key,value] of records) if(now-value.createdAt>=86400000) await tx.delete(key);
+          const eligible=[...records].map(([key,value])=>({key,value,order:String(value.createdAt).padStart(15,'0')+':'+key}))
+            .filter(({value,order})=>value.gateway===policy.active && value.createdAt>=policy.startedAt && now-value.createdAt>=600000 && now-value.createdAt<86400000 && (!policy.assessedThrough || order>policy.assessedThrough))
+            .sort((a,b)=>a.order.localeCompare(b.order));
+          while(eligible.length>=10) {
+            const batch=eligible.splice(0,10);
+            const paid=batch.filter(({value})=>value.paid).length;
+            policy.assessedThrough=batch[9].order;
+            if(paid/10<0.20) {
+              policy.active=policy.active==='blackcat'?'sigilo':'blackcat';
+              policy.startedAt=now;
+              policy.assessedThrough=null;
+              break;
+            }
+          }
+          await tx.put('policy',policy);
+          return policy.active;
+        });
+        return json({gateway:active});
+      }
+      if (path==='/gateway/record') {
+        if (!UUID.test(input.requestId||'') || !['blackcat','sigilo'].includes(input.gateway)) return json({error:'Invalid record'},400);
+        const key='g:'+input.requestId,existing=await this.state.storage.get(key);
+        if (!existing) await this.state.storage.put(key,{gateway:input.gateway,createdAt:Date.now(),paid:false});
+        return json({ok:true});
+      }
+      if (path==='/gateway/paid') {
+        const key='g:'+input.requestId,existing=await this.state.storage.get(key);
+        if (existing && !existing.paid) await this.state.storage.put(key,{...existing,paid:true});
+        return json({ok:true});
+      }
+      return json({error:'Not found'},404);
+    }
     if (new URL(request.url).pathname === '/issue') return this.issue(await request.json());
+    if (new URL(request.url).pathname === '/sigilo-paid') {
+      const input=await request.json(), saved=await this.state.storage.get('sale');
+      if(!saved || saved.gateway!=='sigilo' || !saved.webhookToken || saved.webhookToken!==input.token || saved.response.transactionId!==input.transactionId || saved.requestId!==input.requestId) return json({error:'Inválido'},403);
+      return this.webhook({requestId:input.requestId,transactionId:input.transactionId});
+    }
     if (new URL(request.url).pathname === '/session') return this.session(await request.json());
     if (new URL(request.url).pathname === '/fee') return this.fee(await request.json());
     if (new URL(request.url).pathname === '/status') return this.status();
@@ -347,9 +424,22 @@ export class PixRequest {
       if (result.state === 'complete') return result.createdAt && Date.now() >= result.createdAt + SESSION_TTL ? json({error:'Link expirado.'},410) : json(result.response);
       return unavailablePix(result);
     }
-    const diagnostic={stage:'provider_request',httpStatus:null,providerStatus:null};
-    let transactionId;
+    let gateway='blackcat';
+    if(this.env.SIGILO_PUBLIC_KEY && this.env.SIGILO_SECRET_KEY && this.env.PUBLIC_WORKER_URL) {
+      try {gateway=(await routingCall(this.env,'select',{requestId:sale.externalRef})).gateway;} catch (_) {gateway='blackcat';}
+    }
+    const diagnostic={stage:'provider_request',httpStatus:null,providerStatus:null,gateway};
+    let transactionId, fallbackAttempted=false;
     try {
+      if (gateway==='sigilo') {
+        try {return await this.createSigilo(sale,envelope,fingerprint,diagnostic);}
+        catch (error) {
+          const stored=await this.state.storage.get('sale');
+          if (stored?.state==='complete') return json(stored.response);
+          if(!this.env.BLACKCAT_API_KEY)throw error;
+          fallbackAttempted=true;gateway='blackcat';diagnostic.gateway=gateway;diagnostic.stage='provider_request';diagnostic.httpStatus=null;
+        }
+      }
       const response = await fetch(API, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-API-Key': this.env.BLACKCAT_API_KEY }, body: JSON.stringify(sale), signal: AbortSignal.timeout(20000) });
       diagnostic.httpStatus=response.status;
       diagnostic.stage='provider_json';
@@ -358,7 +448,9 @@ export class PixRequest {
       if (data && typeof data.transactionId === 'string' && data.transactionId.trim() && data.transactionId.length <= 200) transactionId=data.transactionId;
       if (data && ['PENDING','PAID','CANCELLED','REFUNDED','FAILED'].includes(data.status)) diagnostic.providerStatus=data.status;
       diagnostic.stage='provider_response';
-      if (!response.ok || !body || body.success !== true) throw Error('provider rejected');
+      if (!response.ok || !body || body.success !== true) {
+        throw Error('provider rejected');
+      }
       diagnostic.stage='payment_identity';
       if (!data || String(data.paymentMethod).toLowerCase() !== 'pix' || !['PENDING','PAID','CANCELLED','REFUNDED'].includes(data.status) || data.amount !== sale.amount || !transactionId) throw Error('invalid payment');
       diagnostic.stage='pix_code';
@@ -374,17 +466,47 @@ export class PixRequest {
         catch (_) { console.log(JSON.stringify({event:'tmt_customer_capture_failed'})); }
       }
       diagnostic.stage='payment_storage';
-      await this.state.storage.put('sale', { fingerprint, state: 'complete', response: safe, createdAt, requestId:sale.externalRef, meta: envelope.meta || null, purpose:envelope.purpose || 'order', parentRequestId:envelope.parentRequestId || null, ...(tmtCustomer ? {tmtCustomer} : {}) });
+      await this.state.storage.put('sale', { fingerprint, state: 'complete', gateway:'blackcat', response: safe, createdAt, requestId:sale.externalRef, meta: envelope.meta || null, purpose:envelope.purpose || 'order', parentRequestId:envelope.parentRequestId || null, ...(tmtCustomer ? {tmtCustomer} : {}) });
       if (tmtCustomer) await this.scheduleCustomerCleanup(tmtCustomer.expiresAt);
+      if (this.env.SIGILO_PUBLIC_KEY && this.env.SIGILO_SECRET_KEY) {try {await routingCall(this.env,'record',{requestId:sale.externalRef,gateway:'blackcat'});} catch (_) {}}
       return json(safe, 201);
     } catch (_) {
       console.log(JSON.stringify({event:'pix_creation_failed',...diagnostic}));
+      const stored=await this.state.storage.get('sale');
+      if (stored?.state==='complete') return json(stored.response);
+      if (!fallbackAttempted && gateway==='blackcat' && this.env.SIGILO_PUBLIC_KEY && this.env.SIGILO_SECRET_KEY && this.env.PUBLIC_WORKER_URL) {
+        fallbackAttempted=true;diagnostic.gateway='sigilo';diagnostic.stage='provider_request';diagnostic.httpStatus=null;
+        try {return await this.createSigilo(sale,envelope,fingerprint,diagnostic);}
+        catch (_) {console.log(JSON.stringify({event:'pix_fallback_failed',...diagnostic}));}
+      }
       await this.state.storage.transaction(async tx=>{
         const current=await tx.get('sale');
         if (current?.state !== 'complete') await tx.put('sale', { fingerprint, state: 'uncertain', diagnostic, ...(transactionId ? {transactionId} : {}) });
       });
       return json({ code:'PIX_UNCERTAIN',diagnostic,error: 'Não foi possível confirmar a geração do PIX. Não repita a cobrança; entre em contato com a loja.' }, 502);
     }
+  }
+  async createSigilo(sale,envelope,fingerprint,diagnostic) {
+    if (!this.env.SIGILO_PUBLIC_KEY || !this.env.SIGILO_SECRET_KEY || !this.env.PUBLIC_WORKER_URL) throw Error('Sigilo not configured');
+    const payload={identifier:sale.externalRef,amount:sale.amount/100,client:{name:sale.customer.name,email:sale.customer.email,phone:sale.customer.phone,document:sale.customer.document.number},products:sale.items.map((item,index)=>({id:String(index+1),name:item.title,quantity:item.quantity,price:item.unitPrice/100,physical:item.tangible})),callbackUrl:this.env.PUBLIC_WORKER_URL+'/api/sigilo/webhook'};
+    const response=await fetch(SIGILO_API+'/pix/receive',{method:'POST',headers:{...sigiloHeaders(this.env),'Content-Type':'application/json'},body:JSON.stringify(payload),signal:AbortSignal.timeout(20000)});
+    diagnostic.httpStatus=response.status;diagnostic.stage='provider_json';
+    const body=await response.json();diagnostic.stage='provider_response';
+    if (!response.ok || !['OK','PENDING'].includes(body.status) || typeof body.transactionId!=='string' || !body.transactionId || typeof body.pix?.code!=='string' || !body.pix.code.trim()) {
+      const error=Error('Sigilo response invalid');
+      if([400,422].includes(response.status) && !body?.transactionId) {
+        try {await sigiloQuery(this.env,sale.externalRef);} catch(queryError) {if(queryError.message==='Sigilo not found')error.safeFallback=true;}
+      }
+      throw error;
+    }
+    const createdAt=Date.now();
+    const safe={transactionId:body.transactionId,status:'PENDING',amount:sale.amount,paymentData:{copyPaste:body.pix.code,qrCodeBase64:null,expiresAt:body.pix.expiresAt||null}};
+    let tmtCustomer;
+    if (envelope.purpose!=='tmt') {try {tmtCustomer=await this.sealCustomer({name:sale.customer.name,email:sale.customer.email,phone:sale.customer.phone,cpf:sale.customer.document.number},sale.externalRef,createdAt+SESSION_TTL);} catch (_) {console.log(JSON.stringify({event:'tmt_customer_capture_failed'}));}}
+    await this.state.storage.put('sale',{fingerprint,state:'complete',gateway:'sigilo',webhookToken:body.webhookToken||null,response:safe,createdAt,requestId:sale.externalRef,meta:envelope.meta||null,purpose:envelope.purpose||'order',parentRequestId:envelope.parentRequestId||null,...(tmtCustomer?{tmtCustomer}:{})});
+    if(tmtCustomer)await this.scheduleCustomerCleanup(tmtCustomer.expiresAt);
+    try {await routingCall(this.env,'record',{requestId:sale.externalRef,gateway:'sigilo'});} catch (_) {}
+    return json(safe,201);
   }
   async fee({token,kind='tmt',customer,action,source}) {
     if (!['tmt','delivery'].includes(kind)) return json({error:'Cobrança inválida.'},400);
@@ -507,9 +629,16 @@ export class PixRequest {
     if (!saved || saved.state !== 'complete' || saved.response.transactionId !== input.transactionId) return json({error:'Transação desconhecida.'},404);
     if (saved.metaPurchaseSent) { try { await this.mirror(saved); return json({ok:true}); } catch (_) { return json({error:'Persistência indisponível.'},503); } }
     try {
-      const check=await fetch('https://api.blackcatoficial.com/api/sales/' + encodeURIComponent(input.transactionId) + '/status',{headers:{'X-API-Key':this.env.BLACKCAT_API_KEY},signal:AbortSignal.timeout(3500)});
-      const body=await check.json(), data=body && body.data;
-      if (!check.ok || !body.success || !data || data.transactionId !== input.transactionId || data.amount !== saved.response.amount || String(data.paymentMethod).toLowerCase() !== 'pix') return json({error:'Pagamento não verificado.'},503);
+      let data;
+      if (saved.gateway==='sigilo') {
+        const verified=await sigiloQuery(this.env,saved.requestId);
+        data={transactionId:verified.id,amount:Math.round(verified.amount*100),paymentMethod:verified.paymentMethod,status:sigiloStatus(verified.status)};
+      } else {
+        const check=await fetch('https://api.blackcatoficial.com/api/sales/' + encodeURIComponent(input.transactionId) + '/status',{headers:{'X-API-Key':this.env.BLACKCAT_API_KEY},signal:AbortSignal.timeout(3500)});
+        const body=await check.json();data=body && body.data;
+        if (!check.ok || !body.success) return json({error:'Pagamento não verificado.'},503);
+      }
+      if (!data || data.transactionId !== input.transactionId || data.amount !== saved.response.amount || String(data.paymentMethod).toLowerCase() !== 'pix') return json({error:'Pagamento não verificado.'},503);
       if (data.status !== 'PAID') return json({error:'Pagamento ainda não confirmado.'},409);
       const confirmed = await this.state.storage.transaction(async tx => {
         const current = await tx.get('sale');
@@ -517,6 +646,7 @@ export class PixRequest {
         await tx.put('sale',current); return current;
       });
       await this.mirror(confirmed);
+      if (confirmed.response.status==='PAID' && this.env.SIGILO_SECRET_KEY) {try {await routingCall(this.env,'paid',{requestId:saved.requestId});} catch (_) {}}
       if (confirmed.response.status !== 'PAID') return json({ok:true});
       const token = await metaToken(this.env);
       if (!token || !saved.meta || !hasMetaCustomerData(saved.meta.user_data)) return json({ok:true});
@@ -544,6 +674,17 @@ export class PixRequest {
     if (!saved || saved.state !== 'complete') return unavailablePix(saved);
     if (saved.createdAt && Date.now() >= saved.createdAt + SESSION_TTL) return json({error:'Link expirado.'},410);
     if (saved.statusCheckedAt && Date.now() - saved.statusCheckedAt < 15000) return json({ status: saved.response.status, amount: saved.response.amount });
+    if (saved.gateway==='sigilo') {
+      try {
+        const data=await sigiloQuery(this.env,saved.requestId);
+        if(data.id!==saved.response.transactionId || Math.round(data.amount*100)!==saved.response.amount) throw Error('Sigilo amount mismatch');
+        const status=sigiloStatus(data.status);if(!status)throw Error('Sigilo status invalid');
+        const current=await this.state.storage.transaction(async tx=>{const record=await tx.get('sale');if(record.response.status!=='PAID' || status==='REFUNDED')record.response.status=status;record.statusCheckedAt=Date.now();if(record.response.status==='PAID')record.paidAt ||= Date.now();await tx.put('sale',record);return record;});
+        if(current.response.status==='PAID') {try {await routingCall(this.env,'paid',{requestId:saved.requestId});} catch (_) {}}
+        try {await this.mirror(current);} catch (_) {}
+        return json({status:current.response.status,amount:current.response.amount});
+      } catch (_) {return json({error:'Não foi possível consultar o pagamento.'},503);}
+    }
     // Reservar o intervalo antes da chamada para limitar consultas simultâneas.
     const reserved = await this.state.storage.transaction(async tx => {
       const current = await tx.get('sale');
@@ -564,6 +705,7 @@ export class PixRequest {
         await tx.put('sale', current); return current;
       });
       try { await this.mirror(current); } catch (_) { console.log(JSON.stringify({event:'payment_kv_write_failed'})); }
+      if(current.response.status==='PAID' && this.env.SIGILO_SECRET_KEY) {try {await routingCall(this.env,'paid',{requestId:saved.requestId});} catch (_) {}}
       return json({ status: current.response.status, amount: data.amount });
     } catch (_) {
       const current=await this.state.storage.get('sale');

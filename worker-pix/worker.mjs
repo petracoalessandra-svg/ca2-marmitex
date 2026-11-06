@@ -35,6 +35,14 @@ const SESSION_TTL = 86400000;
 const TOKEN = /^([0-9a-f-]{36})\.([0-9a-f]{64})$/;
 const hashToken = async token => Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(token))), x => x.toString(16).padStart(2,'0')).join('');
 
+function unavailablePix(saved) {
+  // A reservation is persisted before calling Blackcat. Only its absence allows
+  // the browser to submit the same request ID again; a generic 404 never does.
+  if (!saved) return json({code:'PIX_NOT_STARTED',error:'Esta tentativa ainda não foi enviada para pagamento.'},404);
+  if (saved.state === 'processing') return json({code:'PIX_PROCESSING',error:'A geração do PIX ainda está em processamento. Aguarde e tente recuperar novamente.'},409);
+  return json({code:'PIX_UNCERTAIN',error:'O resultado da geração do PIX precisa ser conferido na Blackcat.',diagnostic:saved.diagnostic || null},409);
+}
+
 async function paymentSession(request, env, path, cors) {
   if (!env.PAYMENT_SESSIONS || !env.PIX_STATUS_RATE_LIMITER || !env.PIX_REQUESTS) return json({error:'Sessões indisponíveis.'},503,cors);
   const limiter = ['/api/tmt/pix','/api/entrega/pix'].includes(path) ? env.PIX_RATE_LIMITER : env.PIX_STATUS_RATE_LIMITER;
@@ -318,7 +326,7 @@ export class PixRequest {
     if (new URL(request.url).pathname === '/webhook') return this.webhook(await request.json());
     if (new URL(request.url).pathname === '/recover') {
       const saved = await this.state.storage.get('sale');
-      if (!saved || saved.state !== 'complete') return json({ error: 'Cobrança não disponível para recuperação.' }, 404);
+      if (!saved || saved.state !== 'complete') return unavailablePix(saved);
       if (saved.createdAt && Date.now() >= saved.createdAt + SESSION_TTL) return json({error:'Link expirado.'},410);
       return json(saved.response);
     }
@@ -337,27 +345,45 @@ export class PixRequest {
     if (result) {
       if (result.fingerprint !== fingerprint) return json({ error: 'Este identificador já foi usado para outro pedido.' }, 409);
       if (result.state === 'complete') return result.createdAt && Date.now() >= result.createdAt + SESSION_TTL ? json({error:'Link expirado.'},410) : json(result.response);
-      return json({ error: 'A solicitação já foi iniciada. Não crie outra cobrança; entre em contato com a loja.' }, 409);
+      return unavailablePix(result);
     }
+    const diagnostic={stage:'provider_request',httpStatus:null,providerStatus:null};
+    let transactionId;
     try {
       const response = await fetch(API, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-API-Key': this.env.BLACKCAT_API_KEY }, body: JSON.stringify(sale), signal: AbortSignal.timeout(20000) });
+      diagnostic.httpStatus=response.status;
+      diagnostic.stage='provider_json';
       const body = await response.json();
       const data = body && body.data, pix = data && data.paymentData;
-      const code = pix && (pix.copyPaste || pix.qrCode);
-      if (!response.ok || !body.success || !data || String(data.paymentMethod).toLowerCase() !== 'pix' || !['PENDING', 'PAID', 'CANCELLED', 'REFUNDED'].includes(data.status) || data.amount !== sale.amount || typeof data.transactionId !== 'string' || !data.transactionId || data.transactionId.length > 200 || typeof code !== 'string' || !code || code.length > 4096 || !pix || (pix.qrCodeBase64 && (typeof pix.qrCodeBase64 !== 'string' || !/^data:image\/png;base64,[A-Za-z0-9+/=]+$/.test(pix.qrCodeBase64) || pix.qrCodeBase64.length > 500000))) throw Error('invalid response');
-      const safe = { transactionId: data.transactionId, status: data.status, amount: data.amount, paymentData: { copyPaste: code, qrCodeBase64: pix.qrCodeBase64 || null, expiresAt: pix.expiresAt || null } };
+      if (data && typeof data.transactionId === 'string' && data.transactionId.trim() && data.transactionId.length <= 200) transactionId=data.transactionId;
+      if (data && ['PENDING','PAID','CANCELLED','REFUNDED','FAILED'].includes(data.status)) diagnostic.providerStatus=data.status;
+      diagnostic.stage='provider_response';
+      if (!response.ok || !body || body.success !== true) throw Error('provider rejected');
+      diagnostic.stage='payment_identity';
+      if (!data || String(data.paymentMethod).toLowerCase() !== 'pix' || !['PENDING','PAID','CANCELLED','REFUNDED'].includes(data.status) || data.amount !== sale.amount || !transactionId) throw Error('invalid payment');
+      diagnostic.stage='pix_code';
+      const code=pix && [pix.copyPaste,pix.qrCode].find(value=>typeof value==='string' && value.trim() && value.trim().length<=4096);
+      if (!code) throw Error('missing PIX code');
+      // The image is optional: the payment page generates a QR from copyPaste.
+      const qrCodeBase64=typeof pix.qrCodeBase64==='string' && /^data:image\/png;base64,[A-Za-z0-9+/=]+$/.test(pix.qrCodeBase64) && pix.qrCodeBase64.length<=500000 ? pix.qrCodeBase64 : null;
+      const safe = { transactionId, status: data.status, amount: data.amount, paymentData: { copyPaste: code.trim(), qrCodeBase64, expiresAt: typeof pix.expiresAt==='string' && Number.isFinite(Date.parse(pix.expiresAt)) ? pix.expiresAt : null } };
       const createdAt=Date.now();
       let tmtCustomer;
       if (envelope.purpose !== 'tmt') {
         try { tmtCustomer=await this.sealCustomer({name:sale.customer.name,email:sale.customer.email,phone:sale.customer.phone,cpf:sale.customer.document.number},sale.externalRef,createdAt+SESSION_TTL); }
         catch (_) { console.log(JSON.stringify({event:'tmt_customer_capture_failed'})); }
       }
+      diagnostic.stage='payment_storage';
       await this.state.storage.put('sale', { fingerprint, state: 'complete', response: safe, createdAt, requestId:sale.externalRef, meta: envelope.meta || null, purpose:envelope.purpose || 'order', parentRequestId:envelope.parentRequestId || null, ...(tmtCustomer ? {tmtCustomer} : {}) });
       if (tmtCustomer) await this.scheduleCustomerCleanup(tmtCustomer.expiresAt);
       return json(safe, 201);
     } catch (_) {
-      await this.state.storage.put('sale', { fingerprint, state: 'uncertain' });
-      return json({ error: 'Não foi possível confirmar a geração do PIX. Não repita a cobrança; entre em contato com a loja.' }, 502);
+      console.log(JSON.stringify({event:'pix_creation_failed',...diagnostic}));
+      await this.state.storage.transaction(async tx=>{
+        const current=await tx.get('sale');
+        if (current?.state !== 'complete') await tx.put('sale', { fingerprint, state: 'uncertain', diagnostic, ...(transactionId ? {transactionId} : {}) });
+      });
+      return json({ code:'PIX_UNCERTAIN',diagnostic,error: 'Não foi possível confirmar a geração do PIX. Não repita a cobrança; entre em contato com a loja.' }, 502);
     }
   }
   async fee({token,kind='tmt',customer,action,source}) {
@@ -515,7 +541,7 @@ export class PixRequest {
   }
   async status() {
     const saved = await this.state.storage.get('sale');
-    if (!saved || saved.state !== 'complete') return json({ error: 'Cobrança não disponível para consulta.' }, 404);
+    if (!saved || saved.state !== 'complete') return unavailablePix(saved);
     if (saved.createdAt && Date.now() >= saved.createdAt + SESSION_TTL) return json({error:'Link expirado.'},410);
     if (saved.statusCheckedAt && Date.now() - saved.statusCheckedAt < 15000) return json({ status: saved.response.status, amount: saved.response.amount });
     // Reservar o intervalo antes da chamada para limitar consultas simultâneas.

@@ -291,6 +291,76 @@ test('ambiguous upstream failure never retries the same request',async()=>{
   const env=makeEnv(), old=globalThis.fetch; let count=0; globalThis.fetch=async()=>{count++;throw Error('timeout')};
   try {assert.equal((await worker.fetch(req('/api/pix',sale()),env)).status,502);assert.equal((await worker.fetch(req('/api/pix',sale()),env)).status,409);assert.equal(count,1)} finally {globalThis.fetch=old}
 });
+test('recovery distinguishes a request never started from an ambiguous provider result',async()=>{
+  const env=makeEnv(),old=globalThis.fetch;let creates=0;
+  globalThis.fetch=async()=>{creates++;throw Error('timeout')};
+  try {
+    const missing=await worker.fetch(req('/api/pix/recover',{requestId:id}),env);
+    assert.equal(missing.status,404);assert.equal((await missing.json()).code,'PIX_NOT_STARTED');
+    assert.equal(creates,0);
+    await worker.fetch(req('/api/pix',sale()),env);
+    for (const path of ['/api/pix/recover','/api/pix/status']) {
+      const uncertain=await worker.fetch(req(path,{requestId:id}),env);
+      assert.equal(uncertain.status,409);assert.equal((await uncertain.json()).code,'PIX_UNCERTAIN');
+    }
+    assert.equal(creates,1);
+  } finally {globalThis.fetch=old}
+});
+test('a valid PIX copy-and-paste code remains usable when the optional QR image is unusable',async()=>{
+  const old=globalThis.fetch;
+  try {
+    for (const image of ['AAAA','https://image.example/qr.png','data:image/svg+xml;base64,AAAA',{},'']) {
+      const env=makeEnv();let creates=0;
+      globalThis.fetch=async()=>{creates++;const result=response();result.data.paymentData.qrCodeBase64=image;return Response.json(result)};
+      const created=await worker.fetch(req('/api/pix',sale()),env);
+      assert.equal(created.status,201);const data=await created.json();
+      assert.equal(data.paymentData.copyPaste,'000201-test');assert.equal(data.paymentData.qrCodeBase64,null);
+      const recovered=await worker.fetch(req('/api/pix/recover',{requestId:id}),env);
+      assert.equal(recovered.status,200);assert.equal(creates,1);
+    }
+  } finally {globalThis.fetch=old}
+});
+test('a delayed original request and a resumed request cannot create two Blackcat charges',async()=>{
+  const env=makeEnv(),old=globalThis.fetch;let creates=0,finish,started;
+  const entered=new Promise(resolve=>{started=resolve});
+  globalThis.fetch=async()=>{creates++;started();await new Promise(resolve=>{finish=resolve});return Response.json(response())};
+  try {
+    assert.equal((await (await worker.fetch(req('/api/pix/recover',{requestId:id}),env)).json()).code,'PIX_NOT_STARTED');
+    const original=worker.fetch(req('/api/pix',sale()),env);await entered;
+    const duplicate=await worker.fetch(req('/api/pix',sale()),env);
+    assert.equal(duplicate.status,409);assert.equal((await duplicate.json()).code,'PIX_PROCESSING');
+    const recovering=await worker.fetch(req('/api/pix/recover',{requestId:id}),env);
+    assert.equal(recovering.status,409);assert.equal((await recovering.json()).code,'PIX_PROCESSING');
+    finish();assert.equal((await original).status,201);
+    const recovered=await worker.fetch(req('/api/pix/recover',{requestId:id}),env);
+    assert.equal(recovered.status,200);assert.equal((await recovered.json()).paymentData.copyPaste,'000201-test');assert.equal(creates,1);
+  } finally {if(finish)finish();globalThis.fetch=old}
+});
+test('provider errors preserve safe diagnostics without leaking response text or bypassing payment validation',async()=>{
+  const old=globalThis.fetch,oldLog=console.log,logs=[];console.log=value=>logs.push(value);
+  try {
+    const scenarios=[
+      {status:422,body:{success:false,message:'Private customer maria@example.com',error:'52998224725'},stage:'provider_response'},
+      {status:500,body:{success:false},stage:'provider_response'},
+      {status:200,body:{...response(),data:{...response().data,amount:1}},stage:'payment_identity'},
+      {status:200,body:{...response(),data:{...response().data,paymentData:{}}},stage:'pix_code'},
+      {status:200,body:response('FAILED'),stage:'payment_identity'}
+    ];
+    for(const scenario of scenarios) {
+      const env=makeEnv();let creates=0;
+      globalThis.fetch=async()=>{creates++;return Response.json(scenario.body,{status:scenario.status})};
+      const first=await worker.fetch(req('/api/pix',sale()),env);assert.equal(first.status,502);
+      const error=await first.json();assert.equal(error.code,'PIX_UNCERTAIN');
+      assert.equal(error.diagnostic.stage,scenario.stage);assert.equal(error.diagnostic.httpStatus,scenario.status);
+      const recovered=await worker.fetch(req('/api/pix/recover',{requestId:id}),env);
+      assert.equal(recovered.status,409);assert.deepEqual((await recovered.json()).diagnostic,error.diagnostic);assert.equal(creates,1);
+    }
+    for(const value of ['maria@example.com','52998224725','test-only-placeholder','000201-test','txn-test']) assert.equal(JSON.stringify(logs).includes(value),false);
+    const legacy=makeEnv();legacy.testRecords.set(id+':sale',{fingerprint:'legacy',state:'uncertain'});
+    const result=await worker.fetch(req('/api/pix/recover',{requestId:id}),legacy);
+    assert.equal(result.status,409);assert.equal((await result.json()).code,'PIX_UNCERTAIN');
+  } finally {globalThis.fetch=old;console.log=oldLog}
+});
 test('order customizations are bounded, included in metadata and not retained by the durable object',async()=>{
   const env=makeEnv(), old=globalThis.fetch; let sent;
   globalThis.fetch=async(url,init)=>{sent=JSON.parse(init.body);return Response.json(response())};

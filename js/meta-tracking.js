@@ -1,6 +1,6 @@
 (function(root){
   'use strict';
-  var pixel='1179633571678200', endpoint='https://marmita.laura66hg.workers.dev/api/meta', key='meta_customer';
+  var pixel='1179633571678200', endpoint='https://conta2dlv31.ulissonsilvera88.workers.dev/api/meta', key='meta_customer';
   !function(f,b,e,v,n,t,s){if(f.fbq)return;n=f.fbq=function(){n.callMethod?n.callMethod.apply(n,arguments):n.queue.push(arguments)};if(!f._fbq)f._fbq=n;n.push=n;n.loaded=!0;n.version='2.0';n.queue=[];t=b.createElement(e);t.async=!0;t.src=v;s=b.getElementsByTagName(e)[0];s.parentNode.insertBefore(t,s)}(root,document,'script','https://connect.facebook.net/en_US/fbevents.js');
   root.fbq('init',pixel);
   function cookie(name){try{return document.cookie.split('; ').find(function(x){return x.indexOf(name+'=')===0})?.slice(name.length+1)||''}catch(_){return ''}}

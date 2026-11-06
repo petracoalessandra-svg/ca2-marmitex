@@ -112,13 +112,45 @@ test('a changed cart can start a new request after an unresolved attempt',async(
   app.cart.items[0].quantity=2; app.cart.items[0].total=45.98; app.cart.total=45.98; app.cart.subtotal=45.98;
   await readyForPix(app); await app.el('checkout-generate-pix').listeners.click(); assert.equal(calls,2); assert.equal(app.window.location.url,'/pagamento.html');
 });
-test('ambiguous provider failure checks status without issuing another creation when unresolved',async()=>{
+test('a generic recovery 404 from an old Worker never authorizes another creation',async()=>{
   let calls=0; const app=setup(async(url,options)=>{
     if (!options) return {ok:true,json:async()=>({logradouro:'Praça da Sé',bairro:'Sé',localidade:'São Paulo',uf:'SP'})};
-    calls++; if (url.endsWith('/status')) return {ok:false,status:404}; throw Error('offline');
+    calls++; if (url.endsWith('/recover')) return {ok:false,status:404,json:async()=>({error:'Cobrança não disponível para recuperação.'})}; throw Error('offline');
   });
   await readyForPix(app); app.window.PIX_API_BASE_URL='https://pix.example.com'; await app.el('checkout-generate-pix').listeners.click(); await app.el('checkout-generate-pix').listeners.click();
   assert.equal(calls,2); assert.match(app.el('checkout-payment-status').textContent,/não gere outra cobrança/i); assert.equal(app.window.location.url,undefined);
+});
+test('a mobile request lost before reaching the Worker resumes with the same ID after explicit confirmation',async()=>{
+  const calls=[];let creates=0;
+  const app=setup(async(url,options)=>{
+    if(!options)return {ok:true,json:async()=>({logradouro:'Praça da Sé',bairro:'Sé',localidade:'São Paulo',uf:'SP'})};
+    const body=JSON.parse(options.body);calls.push({url,body});
+    if(url.endsWith('/recover'))return {ok:false,status:404,json:async()=>({code:'PIX_NOT_STARTED'})};
+    if(!url.endsWith('/api/pix'))throw Error('Unexpected status query');
+    if(++creates===1)throw Error('mobile offline before delivery');
+    return {ok:true,status:201,json:async()=>({transactionId:'TXN-1',status:'PENDING',amount:2299,paymentData:{copyPaste:'000201pix',qrCodeBase64:null,expiresAt:null}})};
+  });
+  await readyForPix(app);app.window.PIX_API_BASE_URL='https://pix.example.com';
+  await app.el('checkout-generate-pix').listeners.click();await app.el('checkout-generate-pix').listeners.click();
+  assert.equal(app.window.location.url,'/pagamento.html');assert.equal(creates,2);
+  assert.equal(new Set(calls.map(call=>call.body.requestId)).size,1);
+  assert.ok(calls[1].url.endsWith('/recover'));
+});
+test('processing and uncertain attempts stay recoverable without another sale, with a useful error',async()=>{
+  for(const code of ['PIX_PROCESSING','PIX_UNCERTAIN']) {
+    let creates=0,recoveries=0;
+    const app=setup(async(url,options)=>{
+      if(!options)return {ok:true,json:async()=>({logradouro:'Praça da Sé',bairro:'Sé',localidade:'São Paulo',uf:'SP'})};
+      if(url.endsWith('/recover'))recoveries++;else creates++;
+      return {ok:false,status:409,json:async()=>({code,diagnostic:{stage:'provider_response',httpStatus:422}})};
+    });
+    await readyForPix(app);app.window.PIX_API_BASE_URL='https://pix.example.com';
+    await app.el('checkout-generate-pix').listeners.click();const attempt=app.storage.get('checkout_pix_attempt');
+    await app.el('checkout-generate-pix').listeners.click();
+    assert.equal(app.storage.get('checkout_pix_attempt'),attempt);assert.equal(creates,1);assert.equal(recoveries,1);
+    assert.equal(app.window.location.url,undefined);assert.equal(app.el('checkout-generate-pix').disabled,false);
+    assert.match(app.el('checkout-payment-status').textContent,code==='PIX_PROCESSING' ? /processamento/ : /Blackcat.+HTTP 422/);
+  }
 });
 test('requires bairro even if CEP does not provide it',async()=>{
   const app=setup(async()=>({ok:true,json:async()=>({logradouro:'Praça da Sé',bairro:'',localidade:'São Paulo',uf:'SP'})}));
@@ -141,7 +173,7 @@ test('recovers a completed request using the same identifier without creating a 
     return {ok:true,json:async()=>({transactionId:'TXN-1',status:'PENDING',amount:2299,paymentData:{copyPaste:'000201pix',qrCodeBase64:null,expiresAt:null}})};
   });
   await readyForPix(app); app.window.PIX_API_BASE_URL='https://pix.example.com'; await app.el('checkout-generate-pix').listeners.click(); await app.el('checkout-generate-pix').listeners.click();
-  assert.equal(calls.length,3); assert.equal(calls[0].body.requestId,calls[1].body.requestId); assert.equal(calls[0].body.requestId,calls[2].body.requestId); assert.match(calls[2].url,/\/api\/pix\/recover$/); assert.deepEqual(Object.keys(calls[2].body),['requestId']); assert.equal(app.window.location.url,'/pagamento.html'); assert.equal(JSON.parse(app.storage.get('checkout_payment_preview')).addressNeedsConfirmation,true);
+  assert.equal(calls.length,2); assert.equal(calls[0].body.requestId,calls[1].body.requestId); assert.match(calls[1].url,/\/api\/pix\/recover$/); assert.deepEqual(Object.keys(calls[1].body),['requestId']); assert.equal(app.window.location.url,'/pagamento.html'); assert.equal(JSON.parse(app.storage.get('checkout_payment_preview')).addressNeedsConfirmation,true);
 });
 test('oversized item instructions are rejected before a payment request',async()=>{
   let calls=0; const app=setup(async(url,options)=>{

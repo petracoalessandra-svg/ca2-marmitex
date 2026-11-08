@@ -28,17 +28,9 @@ export const PRICES = Object.freeze({
 });
 // END GENERATED PRICES
 
-const API = 'https://api.blackcatoficial.com/api/sales/create-sale';
 const SIGILO_API = 'https://app.sigilopay.com.br/api/v1/gateway';
-const GATEWAY_STATS = 'gateway-routing-v2';
 const sigiloHeaders = env => ({'x-public-key':env.SIGILO_PUBLIC_KEY,'x-secret-key':env.SIGILO_SECRET_KEY});
 function sigiloStatus(value) { return ({PENDING:'PENDING',COMPLETED:'PAID',FAILED:'CANCELLED',EXPIRED:'CANCELLED',REFUNDED:'REFUNDED',CHARGED_BACK:'REFUNDED'})[value] || null; }
-function routingObject(env) { return env.PIX_REQUESTS.get(env.PIX_REQUESTS.idFromName(GATEWAY_STATS)); }
-async function routingCall(env,path,body) {
-  const result=await routingObject(env).fetch('https://worker.internal/gateway/'+path,{method:'POST',body:JSON.stringify(body)});
-  if (!result.ok) throw Error('Gateway routing unavailable');
-  return result.json();
-}
 async function sigiloQuery(env,identifier) {
   const url=new URL(SIGILO_API+'/transactions');url.searchParams.set('clientIdentifier',identifier);
   const response=await fetch(url,{headers:sigiloHeaders(env),signal:AbortSignal.timeout(8000)});
@@ -56,11 +48,11 @@ const TOKEN = /^([0-9a-f-]{36})\.([0-9a-f]{64})$/;
 const hashToken = async token => Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(token))), x => x.toString(16).padStart(2,'0')).join('');
 
 function unavailablePix(saved) {
-  // A reservation is persisted before calling Blackcat. Only its absence allows
+  // A reservation is persisted before calling the provider. Only its absence allows
   // the browser to submit the same request ID again; a generic 404 never does.
   if (!saved) return json({code:'PIX_NOT_STARTED',error:'Esta tentativa ainda não foi enviada para pagamento.'},404);
   if (saved.state === 'processing') return json({code:'PIX_PROCESSING',error:'A geração do PIX ainda está em processamento. Aguarde e tente recuperar novamente.'},409);
-  return json({code:'PIX_UNCERTAIN',error:'O resultado da geração do PIX precisa ser conferido na Blackcat.',diagnostic:saved.diagnostic || null},409);
+  return json({code:'PIX_UNCERTAIN',error:'O resultado da geração do PIX precisa ser conferido no gateway.',diagnostic:saved.diagnostic || null},409);
 }
 
 async function paymentSession(request, env, path, cors) {
@@ -294,7 +286,7 @@ export default {
       if (path === '/api/pix') sale = saleFromInput(body);
       else if (!body || !UUID.test(body.requestId || '')) throw Error('Solicitação inválida.');
     } catch (error) { return json({ error: error instanceof SyntaxError ? 'JSON inválido.' : error.message }, 400, cors); }
-    if (!env.PIX_REQUESTS || (!env.BLACKCAT_API_KEY && !env.SIGILO_SECRET_KEY)) return json({ error: 'Pagamento ainda não configurado.' }, 503, cors);
+    if (!env.PIX_REQUESTS || (path === '/api/pix' && (!env.SIGILO_PUBLIC_KEY || !env.SIGILO_SECRET_KEY || !env.PUBLIC_WORKER_URL))) return json({ error: 'Pagamento ainda não configurado.' }, 503, cors);
     const object = env.PIX_REQUESTS.get(env.PIX_REQUESTS.idFromName(body.requestId.toLowerCase()));
     try {
       const route = path === '/api/pix' ? 'create' : path === '/api/pix/status' ? 'status' : 'recover';
@@ -347,50 +339,12 @@ export class PixRequest {
   }
   async fetch(request) {
     if (request.method !== 'POST') return json({ error: 'Não encontrado.' }, 404);
-    if (new URL(request.url).pathname.startsWith('/gateway/')) {
-      const path=new URL(request.url).pathname, input=await request.json();
-      if (path==='/gateway/select') {
-        const active=await this.state.storage.transaction(async tx=>{
-          const now=Date.now();
-          const policy=await tx.get('policy') || {active:'blackcat',startedAt:0,assessedThrough:null};
-          const records=await tx.list({prefix:'g:'});
-          for(const [key,value] of records) if(now-value.createdAt>=86400000) await tx.delete(key);
-          const eligible=[...records].map(([key,value])=>({key,value,order:String(value.createdAt).padStart(15,'0')+':'+key}))
-            .filter(({value,order})=>value.gateway===policy.active && value.createdAt>=policy.startedAt && now-value.createdAt>=600000 && now-value.createdAt<86400000 && (!policy.assessedThrough || order>policy.assessedThrough))
-            .sort((a,b)=>a.order.localeCompare(b.order));
-          while(eligible.length>=10) {
-            const batch=eligible.splice(0,10);
-            const paid=batch.filter(({value})=>value.paid).length;
-            policy.assessedThrough=batch[9].order;
-            if(paid/10<0.20) {
-              policy.active=policy.active==='blackcat'?'sigilo':'blackcat';
-              policy.startedAt=now;
-              policy.assessedThrough=null;
-              break;
-            }
-          }
-          await tx.put('policy',policy);
-          return policy.active;
-        });
-        return json({gateway:active});
-      }
-      if (path==='/gateway/record') {
-        if (!UUID.test(input.requestId||'') || !['blackcat','sigilo'].includes(input.gateway)) return json({error:'Invalid record'},400);
-        const key='g:'+input.requestId,existing=await this.state.storage.get(key);
-        if (!existing) await this.state.storage.put(key,{gateway:input.gateway,createdAt:Date.now(),paid:false});
-        return json({ok:true});
-      }
-      if (path==='/gateway/paid') {
-        const key='g:'+input.requestId,existing=await this.state.storage.get(key);
-        if (existing && !existing.paid) await this.state.storage.put(key,{...existing,paid:true});
-        return json({ok:true});
-      }
-      return json({error:'Not found'},404);
-    }
     if (new URL(request.url).pathname === '/issue') return this.issue(await request.json());
     if (new URL(request.url).pathname === '/sigilo-paid') {
       const input=await request.json(), saved=await this.state.storage.get('sale');
-      if(!saved || saved.gateway!=='sigilo' || !saved.webhookToken || saved.webhookToken!==input.token || saved.response.transactionId!==input.transactionId || saved.requestId!==input.requestId) return json({error:'Inválido'},403);
+      if(!saved || saved.gateway!=='sigilo' ||
+        (!saved.recoveredWithoutWebhookToken && (!saved.webhookToken || saved.webhookToken!==input.token)) ||
+        saved.response.transactionId!==input.transactionId || saved.requestId!==input.requestId) return json({error:'Inválido'},403);
       return this.webhook({requestId:input.requestId,transactionId:input.transactionId});
     }
     if (new URL(request.url).pathname === '/session') return this.session(await request.json());
@@ -403,6 +357,24 @@ export class PixRequest {
     if (new URL(request.url).pathname === '/webhook') return this.webhook(await request.json());
     if (new URL(request.url).pathname === '/recover') {
       const saved = await this.state.storage.get('sale');
+      if (saved?.state === 'uncertain' && saved.sigiloRecovery) {
+        try {
+          const found = await sigiloQuery(this.env, saved.sigiloRecovery.requestId);
+          const code = found.pixInformation?.qrCode;
+          if (found.currency === 'BRL' && Math.round(found.amount * 100) === saved.sigiloRecovery.amount &&
+              ['PENDING', 'COMPLETED'].includes(found.status) && typeof found.id === 'string' && found.id &&
+              typeof code === 'string' && code.trim() && code.length <= 4096) {
+            const response = {transactionId:found.id,status:sigiloStatus(found.status),amount:saved.sigiloRecovery.amount,
+              paymentData:{copyPaste:code.trim(),qrCodeBase64:null,expiresAt:null}};
+            const {sigiloRecovery, ...original}=saved;
+            await this.state.storage.put('sale', {...original,state:'complete',gateway:'sigilo',response,
+              createdAt:Date.now(),requestId:saved.sigiloRecovery.requestId,meta:saved.sigiloRecovery.meta,
+              purpose:saved.sigiloRecovery.purpose,parentRequestId:saved.sigiloRecovery.parentRequestId,
+              recoveredWithoutWebhookToken:true});
+            return json(response);
+          }
+        } catch (_) { /* A consulta não autoriza criar uma segunda cobrança. */ }
+      }
       if (!saved || saved.state !== 'complete') return unavailablePix(saved);
       if (saved.createdAt && Date.now() >= saved.createdAt + SESSION_TTL) return json({error:'Link expirado.'},410);
       return json(saved.response);
@@ -424,66 +396,20 @@ export class PixRequest {
       if (result.state === 'complete') return result.createdAt && Date.now() >= result.createdAt + SESSION_TTL ? json({error:'Link expirado.'},410) : json(result.response);
       return unavailablePix(result);
     }
-    let gateway='blackcat';
-    if(this.env.SIGILO_PUBLIC_KEY && this.env.SIGILO_SECRET_KEY && this.env.PUBLIC_WORKER_URL) {
-      try {gateway=(await routingCall(this.env,'select',{requestId:sale.externalRef})).gateway;} catch (_) {gateway='blackcat';}
-    }
-    const diagnostic={stage:'provider_request',httpStatus:null,providerStatus:null,gateway};
-    let transactionId, fallbackAttempted=false;
+    const diagnostic={stage:'provider_request',httpStatus:null,providerStatus:null,gateway:'sigilo'};
     try {
-      if (gateway==='sigilo') {
-        try {return await this.createSigilo(sale,envelope,fingerprint,diagnostic);}
-        catch (error) {
-          const stored=await this.state.storage.get('sale');
-          if (stored?.state==='complete') return json(stored.response);
-          if(!this.env.BLACKCAT_API_KEY)throw error;
-          fallbackAttempted=true;gateway='blackcat';diagnostic.gateway=gateway;diagnostic.stage='provider_request';diagnostic.httpStatus=null;
-        }
-      }
-      const response = await fetch(API, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-API-Key': this.env.BLACKCAT_API_KEY }, body: JSON.stringify(sale), signal: AbortSignal.timeout(20000) });
-      diagnostic.httpStatus=response.status;
-      diagnostic.stage='provider_json';
-      const body = await response.json();
-      const data = body && body.data, pix = data && data.paymentData;
-      if (data && typeof data.transactionId === 'string' && data.transactionId.trim() && data.transactionId.length <= 200) transactionId=data.transactionId;
-      if (data && ['PENDING','PAID','CANCELLED','REFUNDED','FAILED'].includes(data.status)) diagnostic.providerStatus=data.status;
-      diagnostic.stage='provider_response';
-      if (!response.ok || !body || body.success !== true) {
-        throw Error('provider rejected');
-      }
-      diagnostic.stage='payment_identity';
-      if (!data || String(data.paymentMethod).toLowerCase() !== 'pix' || !['PENDING','PAID','CANCELLED','REFUNDED'].includes(data.status) || data.amount !== sale.amount || !transactionId) throw Error('invalid payment');
-      diagnostic.stage='pix_code';
-      const code=pix && [pix.copyPaste,pix.qrCode].find(value=>typeof value==='string' && value.trim() && value.trim().length<=4096);
-      if (!code) throw Error('missing PIX code');
-      // The image is optional: the payment page generates a QR from copyPaste.
-      const qrCodeBase64=typeof pix.qrCodeBase64==='string' && /^data:image\/png;base64,[A-Za-z0-9+/=]+$/.test(pix.qrCodeBase64) && pix.qrCodeBase64.length<=500000 ? pix.qrCodeBase64 : null;
-      const safe = { transactionId, status: data.status, amount: data.amount, paymentData: { copyPaste: code.trim(), qrCodeBase64, expiresAt: typeof pix.expiresAt==='string' && Number.isFinite(Date.parse(pix.expiresAt)) ? pix.expiresAt : null } };
-      const createdAt=Date.now();
-      let tmtCustomer;
-      if (envelope.purpose !== 'tmt') {
-        try { tmtCustomer=await this.sealCustomer({name:sale.customer.name,email:sale.customer.email,phone:sale.customer.phone,cpf:sale.customer.document.number},sale.externalRef,createdAt+SESSION_TTL); }
-        catch (_) { console.log(JSON.stringify({event:'tmt_customer_capture_failed'})); }
-      }
-      diagnostic.stage='payment_storage';
-      await this.state.storage.put('sale', { fingerprint, state: 'complete', gateway:'blackcat', response: safe, createdAt, requestId:sale.externalRef, meta: envelope.meta || null, purpose:envelope.purpose || 'order', parentRequestId:envelope.parentRequestId || null, ...(tmtCustomer ? {tmtCustomer} : {}) });
-      if (tmtCustomer) await this.scheduleCustomerCleanup(tmtCustomer.expiresAt);
-      if (this.env.SIGILO_PUBLIC_KEY && this.env.SIGILO_SECRET_KEY) {try {await routingCall(this.env,'record',{requestId:sale.externalRef,gateway:'blackcat'});} catch (_) {}}
-      return json(safe, 201);
+      return await this.createSigilo(sale,envelope,fingerprint,diagnostic);
     } catch (_) {
       console.log(JSON.stringify({event:'pix_creation_failed',...diagnostic}));
       const stored=await this.state.storage.get('sale');
       if (stored?.state==='complete') return json(stored.response);
-      if (!fallbackAttempted && gateway==='blackcat' && this.env.SIGILO_PUBLIC_KEY && this.env.SIGILO_SECRET_KEY && this.env.PUBLIC_WORKER_URL) {
-        fallbackAttempted=true;diagnostic.gateway='sigilo';diagnostic.stage='provider_request';diagnostic.httpStatus=null;
-        try {return await this.createSigilo(sale,envelope,fingerprint,diagnostic);}
-        catch (_) {console.log(JSON.stringify({event:'pix_fallback_failed',...diagnostic}));}
-      }
       await this.state.storage.transaction(async tx=>{
         const current=await tx.get('sale');
-        if (current?.state !== 'complete') await tx.put('sale', { fingerprint, state: 'uncertain', diagnostic, ...(transactionId ? {transactionId} : {}) });
+        if (current?.state !== 'complete') await tx.put('sale', {fingerprint,state:'uncertain',diagnostic,
+          sigiloRecovery:{requestId:sale.externalRef,amount:sale.amount,meta:envelope.meta||null,
+            purpose:envelope.purpose||'order',parentRequestId:envelope.parentRequestId||null}});
       });
-      return json({ code:'PIX_UNCERTAIN',diagnostic,error: 'Não foi possível confirmar a geração do PIX. Não repita a cobrança; entre em contato com a loja.' }, 502);
+      return json({code:'PIX_UNCERTAIN',diagnostic,error:'Não foi possível confirmar a geração do PIX. Não repita a cobrança; entre em contato com a loja.'},502);
     }
   }
   async createSigilo(sale,envelope,fingerprint,diagnostic) {
@@ -493,11 +419,7 @@ export class PixRequest {
     diagnostic.httpStatus=response.status;diagnostic.stage='provider_json';
     const body=await response.json();diagnostic.stage='provider_response';
     if (!response.ok || !['OK','PENDING'].includes(body.status) || typeof body.transactionId!=='string' || !body.transactionId || typeof body.pix?.code!=='string' || !body.pix.code.trim()) {
-      const error=Error('Sigilo response invalid');
-      if([400,422].includes(response.status) && !body?.transactionId) {
-        try {await sigiloQuery(this.env,sale.externalRef);} catch(queryError) {if(queryError.message==='Sigilo not found')error.safeFallback=true;}
-      }
-      throw error;
+      throw Error('Sigilo response invalid');
     }
     const createdAt=Date.now();
     const safe={transactionId:body.transactionId,status:'PENDING',amount:sale.amount,paymentData:{copyPaste:body.pix.code,qrCodeBase64:null,expiresAt:body.pix.expiresAt||null}};
@@ -505,7 +427,6 @@ export class PixRequest {
     if (envelope.purpose!=='tmt') {try {tmtCustomer=await this.sealCustomer({name:sale.customer.name,email:sale.customer.email,phone:sale.customer.phone,cpf:sale.customer.document.number},sale.externalRef,createdAt+SESSION_TTL);} catch (_) {console.log(JSON.stringify({event:'tmt_customer_capture_failed'}));}}
     await this.state.storage.put('sale',{fingerprint,state:'complete',gateway:'sigilo',webhookToken:body.webhookToken||null,response:safe,createdAt,requestId:sale.externalRef,meta:envelope.meta||null,purpose:envelope.purpose||'order',parentRequestId:envelope.parentRequestId||null,...(tmtCustomer?{tmtCustomer}:{})});
     if(tmtCustomer)await this.scheduleCustomerCleanup(tmtCustomer.expiresAt);
-    try {await routingCall(this.env,'record',{requestId:sale.externalRef,gateway:'sigilo'});} catch (_) {}
     return json(safe,201);
   }
   async fee({token,kind='tmt',customer,action,source}) {
@@ -646,7 +567,6 @@ export class PixRequest {
         await tx.put('sale',current); return current;
       });
       await this.mirror(confirmed);
-      if (confirmed.response.status==='PAID' && this.env.SIGILO_SECRET_KEY) {try {await routingCall(this.env,'paid',{requestId:saved.requestId});} catch (_) {}}
       if (confirmed.response.status !== 'PAID') return json({ok:true});
       const token = await metaToken(this.env);
       if (!token || !saved.meta || !hasMetaCustomerData(saved.meta.user_data)) return json({ok:true});
@@ -680,7 +600,6 @@ export class PixRequest {
         if(data.id!==saved.response.transactionId || Math.round(data.amount*100)!==saved.response.amount) throw Error('Sigilo amount mismatch');
         const status=sigiloStatus(data.status);if(!status)throw Error('Sigilo status invalid');
         const current=await this.state.storage.transaction(async tx=>{const record=await tx.get('sale');if(record.response.status!=='PAID' || status==='REFUNDED')record.response.status=status;record.statusCheckedAt=Date.now();if(record.response.status==='PAID')record.paidAt ||= Date.now();await tx.put('sale',record);return record;});
-        if(current.response.status==='PAID') {try {await routingCall(this.env,'paid',{requestId:saved.requestId});} catch (_) {}}
         try {await this.mirror(current);} catch (_) {}
         return json({status:current.response.status,amount:current.response.amount});
       } catch (_) {return json({error:'Não foi possível consultar o pagamento.'},503);}
@@ -705,7 +624,6 @@ export class PixRequest {
         await tx.put('sale', current); return current;
       });
       try { await this.mirror(current); } catch (_) { console.log(JSON.stringify({event:'payment_kv_write_failed'})); }
-      if(current.response.status==='PAID' && this.env.SIGILO_SECRET_KEY) {try {await routingCall(this.env,'paid',{requestId:saved.requestId});} catch (_) {}}
       return json({ status: current.response.status, amount: data.amount });
     } catch (_) {
       const current=await this.state.storage.get('sale');

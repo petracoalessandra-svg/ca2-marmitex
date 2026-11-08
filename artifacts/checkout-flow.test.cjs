@@ -142,14 +142,14 @@ test('processing and uncertain attempts stay recoverable without another sale, w
     const app=setup(async(url,options)=>{
       if(!options)return {ok:true,json:async()=>({logradouro:'Praça da Sé',bairro:'Sé',localidade:'São Paulo',uf:'SP'})};
       if(url.endsWith('/recover'))recoveries++;else creates++;
-      return {ok:false,status:409,json:async()=>({code,diagnostic:{stage:'provider_response',httpStatus:422}})};
+      return {ok:false,status:409,json:async()=>({code,diagnostic:{stage:'provider_response',httpStatus:503,gateway:'sigilo'}})};
     });
     await readyForPix(app);app.window.PIX_API_BASE_URL='https://pix.example.com';
     await app.el('checkout-generate-pix').listeners.click();const attempt=app.storage.get('checkout_pix_attempt');
     await app.el('checkout-generate-pix').listeners.click();
     assert.equal(app.storage.get('checkout_pix_attempt'),attempt);assert.equal(creates,1);assert.equal(recoveries,1);
     assert.equal(app.window.location.url,undefined);assert.equal(app.el('checkout-generate-pix').disabled,false);
-    assert.match(app.el('checkout-payment-status').textContent,code==='PIX_PROCESSING' ? /processamento/ : /Blackcat.+HTTP 422/);
+    assert.match(app.el('checkout-payment-status').textContent,code==='PIX_PROCESSING' ? /processamento/ : /Sigilo Pay.+HTTP 503/);
   }
 });
 test('requires bairro even if CEP does not provide it',async()=>{

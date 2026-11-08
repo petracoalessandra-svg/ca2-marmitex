@@ -1,15 +1,16 @@
 # Worker PIX
 
-## Dois gateways e seleção automática
+## Gateway ativo: Sigilo Pay
 
-O Worker usa Blackcat e Sigilo Pay sem mudar o contrato do frontend. A Sigilo exige `SIGILO_PUBLIC_KEY` e `SIGILO_SECRET_KEY` como secrets do Worker; configure-os diretamente na Cloudflare. A chave privada não deve entrar no código, no Git ou no navegador. `PUBLIC_WORKER_URL` aponta para a URL pública deste Worker e define o callback `POST /api/sigilo/webhook`. Configure as credenciais antes de publicar. As cobranças antigas permanecem vinculadas ao gateway em que foram criadas.
+Novos PIX são criados exclusivamente pela Sigilo Pay, inclusive os das taxas. Não há seleção por conversão nem tentativa em outro gateway. Configure SIGILO_PUBLIC_KEY e SIGILO_SECRET_KEY como secrets e PUBLIC_WORKER_URL como variável do Worker. O callback é POST /api/sigilo/webhook. Não coloque as chaves no código ou navegador.
 
-Para novos pedidos, o Durable Object `gateway-routing-v2` em `PIX_REQUESTS` mantém um gateway ativo. Inicialmente é a Blackcat; todos os novos pedidos tentam esse gateway primeiro. O outro só recebe um pedido se houver fallback durante a geração. O seletor é reavaliado na chegada de cada pedido novo, sem tarefa periódica. Ele considera somente PIX gerados com código pelo gateway ativo, com pelo menos 10 minutos e menos de 24 horas, ainda não usados em avaliação. A cada lote fechado de 10 PIX elegíveis, calcula pagamentos confirmados / 10: com 0 ou 1 pago (menos de 20%), alterna o gateway ativo; com 2 ou mais pagos, mantém o atual e passa ao próximo lote. Cada PIX entra em apenas um lote. Depois da troca, a contagem do novo gateway começa com os PIX gerados desde a ativação. Webhooks e consultas autenticadas atualizam as confirmações; sem consulta ou webhook, a taxa observada pode ficar defasada. Os registros com mais de 24 horas são removidos nas avaliações seguintes. Cobranças anteriores preservam seu gateway, mesmo após uma troca.
+Se a geração falhar ou expirar, a tentativa é preservada como incerta, sem criar outro PIX automaticamente. A recuperação consulta a Sigilo pelo identificador e só devolve a cobrança após verificar valor, moeda, status e código. Se não conseguir comprová-la, confira no painel da Sigilo antes de qualquer nova tentativa.
 
-Se a geração não entregar um PIX utilizável, inclusive em HTTP 500 ou timeout, o Worker tenta o outro gateway com o mesmo identificador do pedido e retorna o código que conseguir gerar. Isso evita mostrar o erro intermediário ao cliente, mas **pode criar duas cobranças** se o primeiro gateway tiver criado uma transação apesar da falha na resposta. A documentação da Blackcat não oferece consulta por `externalRef` para eliminar essa incerteza. Verifique reconciliação e possíveis cobranças duplicadas em ambos os painéis antes de ativar. Se os dois gateways falharem, o Worker mantém a tentativa como incerta e não cria uma terceira cobrança.
+A consulta e o webhook da Blackcat permanecem apenas para confirmar cobranças antigas já geradas. Preserve o secret Blackcat e o webhook antigo enquanto houver pagamentos anteriores a reconciliar.
 
-Os testes locais usam credenciais fictícias e não geram cobranças reais. Antes de publicar, confira os bindings `PIX_REQUESTS`, `PAYMENT_SESSIONS`, rate limiters, secrets, webhook da Blackcat e o callback da Sigilo no Worker de destino. Publique manualmente `worker.mjs` com `wrangler.toml` compatível; copiar apenas o código não cria secrets ou bindings.
+Para publicação manual, envie worker.mjs ao Worker compatível com wrangler.toml e confira os bindings e secrets existentes. Copiar o arquivo não cria recursos. Os testes específicos são executados com node --test worker-pix/sigilo-only.test.mjs.
 
+> As seções históricas abaixo foram escritas para a integração anterior. Referências à criação, fallback, seleção ou webhook padrão da Blackcat não descrevem os novos PIX. Os testes antigos worker.test.mjs também pressupõem criação na Blackcat e precisam ser migrados.
 ## Cadastro do pet no Supabase
 
 Antes do deploy manual, execute `worker-pix/supabase-pet-registrations.sql` no SQL Editor do projeto Supabase. O arquivo cria `public.pet_registrations` com identificação, nome, validade da vacinação, código, identificação da carteira de vacina, endereço de cobrança e parcelamento. A tabela tem RLS ativo e não permite acesso direto pelos papéis públicos.
@@ -39,6 +40,8 @@ O checkout agora recupera diretamente o PIX salvo em `/api/pix/recover`, sem exi
 - `404 / PIX_NOT_STARTED`: nenhuma reserva dessa tentativa existe no Durable Object. O checkout pode reenviar o pedido completo com **o mesmo requestId**. A reserva atômica antes da chamada à Blackcat impede duplicidade se a requisição original chegar atrasada.
 - `409 / PIX_PROCESSING`: a reserva existe e a solicitação está em andamento. Tentar recuperar novamente não cria outra cobrança.
 - `409 / PIX_UNCERTAIN`: a chamada foi iniciada, mas seu resultado não foi confirmado. A tentativa permanece preservada para conferência. Um 404 genérico de versões antigas nunca autoriza recriação.
+
+Quando a Sigilo Pay foi tentada e não entregou resposta válida (por exemplo, HTTP 503), a recuperação de uma tentativa nova consulta `GET /transactions?clientIdentifier=...` com o mesmo identificador. Se a Sigilo confirmar transação PIX em BRL, com valor correto e QR Code utilizável, o Worker devolve essa cobrança sem emitir outra criação. Se a consulta também falhar ou não comprovar esses campos, a tentativa continua incerta. O recurso depende dos dados de recuperação gravados pela versão nova do Worker; tentativas incertas anteriores à publicação continuam exigindo conferência nos painéis. O texto do checkout agora identifica o gateway que retornou o diagnóstico, sem atribuir sempre a falha à Blackcat. Um HTTP 503 da Sigilo não pode ser corrigido pelo código do site: é preciso verificar disponibilidade, credenciais e resposta da API com o provedor.
 
 Uma imagem de QR ausente ou inválida não descarta um código copia e cola válido; a página de pagamento já gera o QR localmente. Valor, ID, método e status da cobrança continuam sendo validados.
 

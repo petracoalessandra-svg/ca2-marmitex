@@ -385,6 +385,30 @@ test('a Blackcat 500 falls back to Sigilo and returns its PIX',async()=>{
   globalThis.fetch=async url=>{calls.push(String(url));return String(url).includes('blackcatoficial')?Response.json({success:false},{status:500}):Response.json({transactionId:'sigilo-after-500',status:'OK',webhookToken:'hook',pix:{code:'000201-after-500'}})};
   try {const created=await worker.fetch(req('/api/pix',input),env);assert.equal(created.status,201);assert.equal((await created.json()).paymentData.copyPaste,'000201-after-500');assert.equal(calls.length,2);assert.match(calls[0],/blackcatoficial/);assert.match(calls[1],/sigilopay/);assert.equal((await worker.fetch(req('/api/pix/recover',{requestId:chosen}),env)).status,200);} finally {globalThis.fetch=old}
 });
+test('a Sigilo 503 keeps one attempt and recovers an existing PIX by identifier',async()=>{
+  const env=makeEnv(),old=globalThis.fetch,calls=[];
+  env.SIGILO_PUBLIC_KEY='test-public';env.SIGILO_SECRET_KEY='test-secret';env.PUBLIC_WORKER_URL='https://worker.example';
+  let correctAmount=false;
+  globalThis.fetch=async url=>{
+    calls.push(String(url));
+    if(String(url).includes('blackcatoficial')) return Response.json({success:false},{status:503});
+    if(String(url).includes('/pix/receive')) return Response.json({statusCode:503},{status:503});
+    return Response.json({id:'sigilo-recovered',clientIdentifier:id,currency:'BRL',amount:correctAmount?27.99:99.99,
+      paymentMethod:'PIX',status:'PENDING',pixInformation:{qrCode:'000201-recovered'}});
+  };
+  try {
+    const failed=await worker.fetch(req('/api/pix',sale()),env);
+    assert.equal(failed.status,502);
+    assert.equal((await failed.json()).diagnostic.gateway,'sigilo');
+    assert.equal((await worker.fetch(req('/api/pix/recover',{requestId:id}),env)).status,409);
+    correctAmount=true;
+    const recovered=await worker.fetch(req('/api/pix/recover',{requestId:id}),env);
+    assert.equal(recovered.status,200);
+    assert.equal((await recovered.json()).paymentData.copyPaste,'000201-recovered');
+    assert.equal(calls.filter(url=>url.includes('/pix/receive')).length,1);
+    assert.equal(env.testRecords.get(id+':sale').gateway,'sigilo');
+  } finally {globalThis.fetch=old}
+});
 test('a definitive Blackcat validation rejection falls back to Sigilo on the same order ID',async()=>{
   const env=makeEnv(),old=globalThis.fetch,calls=[];env.SIGILO_PUBLIC_KEY='test-public';env.SIGILO_SECRET_KEY='test-secret';env.PUBLIC_WORKER_URL='https://worker.example';
   const router=env.PIX_REQUESTS.get(env.PIX_REQUESTS.idFromName('gateway-routing-v2'));let chosen;

@@ -524,8 +524,9 @@
           } else if (failure && failure.code==='PIX_UNCERTAIN') {
             const diagnostic=failure.diagnostic || {};
             const http=Number.isInteger(diagnostic.httpStatus) && diagnostic.httpStatus>=100 && diagnostic.httpStatus<=599 ? ' (HTTP '+diagnostic.httpStatus+')' : '';
-            const detail=diagnostic.stage==='pix_code' ? 'A Blackcat respondeu sem um código PIX utilizável.' : diagnostic.stage==='provider_response' ? 'A Blackcat não confirmou a geração do PIX'+http+'.' : 'Não foi possível confirmar a resposta da geração do PIX.';
-            status('checkout-payment-status',detail+' Confira a venda na Blackcat; não gere outra cobrança.');
+            const provider=diagnostic.gateway==='sigilo' ? 'Sigilo Pay' : diagnostic.gateway==='blackcat' ? 'Blackcat' : 'gateway';
+            const detail=diagnostic.stage==='pix_code' ? 'O '+provider+' respondeu sem um código PIX utilizável.' : diagnostic.stage==='provider_response' ? 'O '+provider+' não confirmou a geração do PIX'+http+'.' : 'Não foi possível confirmar a resposta da geração do PIX.';
+            status('checkout-payment-status',detail+' Confira a transação nos gateways e tente recuperar este mesmo pedido; não gere outra cobrança.');
           } else if (!recovering && response.status >= 400 && response.status < 500 && ![408, 409, 429].includes(response.status)) {
             root.sessionStorage.removeItem('checkout_pix_attempt');
             status('checkout-payment-status', 'Não foi possível gerar o PIX. Confira os dados e tente novamente.');

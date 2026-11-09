@@ -1,3 +1,17 @@
+# Gateway atual: VenoPag
+
+Novas cobranças PIX usam a VenoPag em `https://venopagments.com`; os caminhos de consulta e webhook antigos permanecem para cobranças já criadas na Sigilo e na Blackcat. O navegador continua usando o mesmo contrato do Worker. Não há deploy automático.
+
+Antes da publicação manual, configure no Worker os secrets `VENO_CLIENT_ID`, `VENO_CLIENT_SECRET` e `VENO_WEBHOOK_SECRET` pelo painel da Cloudflare. Configure também `PUBLIC_WORKER_URL` com a URL pública do Worker e mantenha os bindings e secrets existentes necessários para sessões e cobranças anteriores. Não coloque credenciais em arquivos, código do navegador ou repositório. Como as credenciais foram compartilhadas no chat, recomenda-se gerar novas no painel da VenoPag e usar as novas no Worker.
+
+Cada cobrança informa a URL `https://conta2dlv31.ulissonsilvera88.workers.dev/api/venopag/webhook?id=<UUID>` (o domínio é derivado de `PUBLIC_WORKER_URL`). O webhook valida o HMAC do corpo original, o Client ID e a janela de cinco minutos; a transação e o valor são confirmados por consulta autenticada antes de alterar o estado. O estado é idempotente por cobrança e confirmado novamente na VenoPag, inclusive para reversões e confirmação após expiração. Preserve os webhooks e as credenciais antigos até reconciliar as cobranças anteriores.
+
+Se a resposta da criação for perdida, inválida ou indicar erro, a tentativa fica bloqueada como incerta: a VenoPag não documenta pesquisa de cobrança pelo UUID local, portanto confira o painel antes de criar outra. A integração não faz uma segunda cobrança automaticamente. A validade vem de `expire_minutes`; os limites são definidos pela VenoPag. Antes de receber pedidos, publique manualmente o Worker e valide o fluxo com uma cobrança real controlada, incluindo webhook e confirmação. A URL de produção é a única documentada; não foi feito teste real nem deploy.
+
+Teste local: `node --test worker-pix/venopag.test.mjs`. As seções abaixo registram o histórico de integrações anteriores e não descrevem a criação atual.
+
+---
+
 # Worker PIX
 
 ## Gateway ativo: Sigilo Pay

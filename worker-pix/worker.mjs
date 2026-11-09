@@ -29,6 +29,14 @@ export const PRICES = Object.freeze({
 // END GENERATED PRICES
 
 const SIGILO_API = 'https://app.sigilopay.com.br/api/v1/gateway';
+const VENO_API = 'https://venopagments.com';
+const venoHeaders = env => ({'X-Client-Id':env.VENO_CLIENT_ID,'X-Client-Secret':env.VENO_CLIENT_SECRET});
+const venoStatus = status => ({pending:'PENDING',confirmed:'PAID',expired:'CANCELLED',canceled:'CANCELLED',contested:'REFUNDED',chargedback:'REFUNDED',refunded:'REFUNDED'})[status] || 'PENDING';
+async function venoQuery(env, number) {
+  const url=new URL(VENO_API+'/api/consult-transaction'); url.searchParams.set('request_number',number);
+  const response=await fetch(url,{headers:venoHeaders(env),signal:AbortSignal.timeout(10000)});
+  const body=await response.json(); if(body.ok!==true) throw Error('VenoPag consultation failed'); return body;
+}
 const sigiloHeaders = env => ({'x-public-key':env.SIGILO_PUBLIC_KEY,'x-secret-key':env.SIGILO_SECRET_KEY});
 function sigiloStatus(value) { return ({PENDING:'PENDING',COMPLETED:'PAID',FAILED:'CANCELLED',EXPIRED:'CANCELLED',REFUNDED:'REFUNDED',CHARGED_BACK:'REFUNDED'})[value] || null; }
 async function sigiloQuery(env,identifier) {
@@ -255,8 +263,26 @@ async function sigiloWebhook(request,env) {
   } catch (_) {return json({error:'Indisponível'},503);}
 }
 
+async function venoWebhook(request,env) {
+  if(request.method!=='POST') return json({error:'Método inválido.'},405);
+  if(!env.VENO_WEBHOOK_SECRET || !env.VENO_CLIENT_ID || !env.PIX_REQUESTS) return json({error:'Indisponível.'},503);
+  const id=new URL(request.url).searchParams.get('id');
+  const signature=request.headers.get('X-Veno-Signature') || '';
+  const match=/^t=(\d+),v1=([0-9a-f]{64})$/i.exec(signature);
+  if(!UUID.test(id||'') || !match || Math.abs(Date.now()/1000-Number(match[1]))>300 || request.headers.get('X-Veno-Client-Id')!==env.VENO_CLIENT_ID || !request.headers.get('X-Veno-Event-Id')) return json({error:'Assinatura inválida.'},401);
+  if(Number(request.headers.get('Content-Length'))>16384) return json({error:'Muito grande.'},413);
+  const raw=await request.text(); if(new TextEncoder().encode(raw).length>16384) return json({error:'Muito grande.'},413);
+  const key=await crypto.subtle.importKey('raw',new TextEncoder().encode(env.VENO_WEBHOOK_SECRET),{name:'HMAC',hash:'SHA-256'},false,['verify']);
+  const bytes=Uint8Array.from(match[2].match(/../g),x=>parseInt(x,16));
+  if(!await crypto.subtle.verify('HMAC',key,bytes,new TextEncoder().encode(match[1]+'.'+raw))) return json({error:'Assinatura inválida.'},401);
+  let body; try {body=JSON.parse(raw);} catch (_) {return json({error:'JSON inválido.'},400);}
+  if(body?.type!=='cashin' || typeof body.request_number!=='string' || typeof body.transaction_id!=='string') return json({error:'Evento inválido.'},400);
+  try {const object=env.PIX_REQUESTS.get(env.PIX_REQUESTS.idFromName(id.toLowerCase()));return await object.fetch('https://worker.internal/veno-webhook',{method:'POST',body:JSON.stringify({requestId:id.toLowerCase(),requestNumber:body.request_number,transactionId:body.transaction_id})});} catch (_) {return json({error:'Indisponível.'},503);}
+}
+
 export default {
   async fetch(request, env) {
+    if (new URL(request.url).pathname === '/api/venopag/webhook') return venoWebhook(request, env);
     if (new URL(request.url).pathname === '/api/blackcat/webhook') return blackcatWebhook(request, env);
     if (new URL(request.url).pathname === '/api/sigilo/webhook') return sigiloWebhook(request, env);
     const origin = allowedOrigin(request, env);
@@ -286,7 +312,7 @@ export default {
       if (path === '/api/pix') sale = saleFromInput(body);
       else if (!body || !UUID.test(body.requestId || '')) throw Error('Solicitação inválida.');
     } catch (error) { return json({ error: error instanceof SyntaxError ? 'JSON inválido.' : error.message }, 400, cors); }
-    if (!env.PIX_REQUESTS || (path === '/api/pix' && (!env.SIGILO_PUBLIC_KEY || !env.SIGILO_SECRET_KEY || !env.PUBLIC_WORKER_URL))) return json({ error: 'Pagamento ainda não configurado.' }, 503, cors);
+    if (!env.PIX_REQUESTS || (path === '/api/pix' && (!env.VENO_CLIENT_ID || !env.VENO_CLIENT_SECRET || !env.VENO_WEBHOOK_SECRET || !env.PUBLIC_WORKER_URL))) return json({ error: 'Pagamento ainda não configurado.' }, 503, cors);
     const object = env.PIX_REQUESTS.get(env.PIX_REQUESTS.idFromName(body.requestId.toLowerCase()));
     try {
       const route = path === '/api/pix' ? 'create' : path === '/api/pix/status' ? 'status' : 'recover';
@@ -340,6 +366,13 @@ export class PixRequest {
   async fetch(request) {
     if (request.method !== 'POST') return json({ error: 'Não encontrado.' }, 404);
     if (new URL(request.url).pathname === '/issue') return this.issue(await request.json());
+    if (new URL(request.url).pathname === '/veno-webhook') {
+      const input=await request.json(), saved=await this.state.storage.get('sale');
+      if(!saved || saved.state!=='complete') return json({error:'Cobrança ainda indisponível.'},503);
+      if(saved.gateway!=='veno' || saved.requestId!==input.requestId || saved.venoRequestNumber!==input.requestNumber || saved.response.transactionId!==input.transactionId) return json({error:'Transação desconhecida.'},404);
+      const result=await this.venoRefresh(saved); if(!result.ok) return result;
+      const data=await result.json(); return data.status==='PAID' ? this.webhook(input) : json({ok:true});
+    }
     if (new URL(request.url).pathname === '/sigilo-paid') {
       const input=await request.json(), saved=await this.state.storage.get('sale');
       if(!saved || saved.gateway!=='sigilo' ||
@@ -396,9 +429,9 @@ export class PixRequest {
       if (result.state === 'complete') return result.createdAt && Date.now() >= result.createdAt + SESSION_TTL ? json({error:'Link expirado.'},410) : json(result.response);
       return unavailablePix(result);
     }
-    const diagnostic={stage:'provider_request',httpStatus:null,providerStatus:null,gateway:'sigilo'};
+    const diagnostic={stage:'provider_request',httpStatus:null,providerStatus:null,gateway:'venopag'};
     try {
-      return await this.createSigilo(sale,envelope,fingerprint,diagnostic);
+      return await this.createVeno(sale,envelope,fingerprint,diagnostic);
     } catch (_) {
       console.log(JSON.stringify({event:'pix_creation_failed',...diagnostic}));
       const stored=await this.state.storage.get('sale');
@@ -406,11 +439,31 @@ export class PixRequest {
       await this.state.storage.transaction(async tx=>{
         const current=await tx.get('sale');
         if (current?.state !== 'complete') await tx.put('sale', {fingerprint,state:'uncertain',diagnostic,
-          sigiloRecovery:{requestId:sale.externalRef,amount:sale.amount,meta:envelope.meta||null,
-            purpose:envelope.purpose||'order',parentRequestId:envelope.parentRequestId||null}});
+          });
       });
       return json({code:'PIX_UNCERTAIN',diagnostic,error:'Não foi possível confirmar a geração do PIX. Não repita a cobrança; entre em contato com a loja.'},502);
     }
+  }
+  async createVeno(sale,envelope,fingerprint,diagnostic) {
+    if(!this.env.VENO_CLIENT_ID || !this.env.VENO_CLIENT_SECRET || !this.env.VENO_WEBHOOK_SECRET || !this.env.PUBLIC_WORKER_URL) throw Error('VenoPag not configured');
+    const callback=new URL('/api/venopag/webhook',this.env.PUBLIC_WORKER_URL); callback.searchParams.set('id',sale.externalRef);
+    const payload={amount:sale.amount/100,name:sale.customer.name,document:sale.customer.document.number,description:'Pedido '+sale.externalRef,webhook_url:callback.toString()};
+    const response=await fetch(VENO_API+'/api/cashin',{method:'POST',headers:{...venoHeaders(this.env),'Content-Type':'application/json'},body:JSON.stringify(payload),signal:AbortSignal.timeout(20000)});
+    diagnostic.httpStatus=response.status; const body=await response.json(); diagnostic.providerStatus=body.ok===true?'ok':'error';
+    if(body.ok!==true || body.status!=='pending' || Math.round(body.amount*100)!==sale.amount || typeof body.request_number!=='string' || !body.request_number || typeof body.transaction_id!=='string' || !body.transaction_id || typeof body.copyPaste!=='string' || !body.copyPaste.trim() || !Number.isFinite(body.expire_minutes) || body.expire_minutes<=0) throw Error('Invalid VenoPag response');
+    const createdAt=Date.now(), safe={transactionId:body.transaction_id,status:'PENDING',amount:sale.amount,paymentData:{copyPaste:body.copyPaste,qrCodeBase64:body.qr_img?'data:image/png;base64,'+body.qr_img:null,expiresAt:new Date(createdAt+body.expire_minutes*60000).toISOString()}};
+    let tmtCustomer; if(envelope.purpose!=='tmt') {try {tmtCustomer=await this.sealCustomer({name:sale.customer.name,email:sale.customer.email,phone:sale.customer.phone,cpf:sale.customer.document.number},sale.externalRef,createdAt+SESSION_TTL);} catch (_) {}}
+    await this.state.storage.put('sale',{fingerprint,state:'complete',gateway:'veno',venoRequestNumber:body.request_number,response:safe,createdAt,requestId:sale.externalRef,meta:envelope.meta||null,purpose:envelope.purpose||'order',parentRequestId:envelope.parentRequestId||null,...(tmtCustomer?{tmtCustomer}:{})});
+    if(tmtCustomer) await this.scheduleCustomerCleanup(tmtCustomer.expiresAt); return json(safe,201);
+  }
+  async venoRefresh(saved) {
+    try {
+      const data=await venoQuery(this.env,saved.venoRequestNumber);
+      if(data.request_number!==saved.venoRequestNumber || data.transaction_id!==saved.response.transactionId || Math.round(data.amount*100)!==saved.response.amount || (data.currency && data.currency!=='BRL')) throw Error('VenoPag mismatch');
+      const status=venoStatus(data.status);
+      const current=await this.state.storage.transaction(async tx=>{const record=await tx.get('sale');record.response.status=status;record.venoStatus=data.status;record.statusCheckedAt=Date.now();if(status==='PAID')record.paidAt ||= Date.now();await tx.put('sale',record);return record;});
+      try {await this.mirror(current);} catch (_) {} return json({status:current.response.status,amount:current.response.amount});
+    } catch (_) {return json({error:'Não foi possível consultar o pagamento.'},503);}
   }
   async createSigilo(sale,envelope,fingerprint,diagnostic) {
     if (!this.env.SIGILO_PUBLIC_KEY || !this.env.SIGILO_SECRET_KEY || !this.env.PUBLIC_WORKER_URL) throw Error('Sigilo not configured');
@@ -551,7 +604,11 @@ export class PixRequest {
     if (saved.metaPurchaseSent) { try { await this.mirror(saved); return json({ok:true}); } catch (_) { return json({error:'Persistência indisponível.'},503); } }
     try {
       let data;
-      if (saved.gateway==='sigilo') {
+      if (saved.gateway==='veno') {
+        const verified=await venoQuery(this.env,saved.venoRequestNumber);
+        if(verified.request_number!==saved.venoRequestNumber) return json({error:'Pagamento não verificado.'},503);
+        data={transactionId:verified.transaction_id,amount:Math.round(verified.amount*100),paymentMethod:'pix',status:venoStatus(verified.status)};
+      } else if (saved.gateway==='sigilo') {
         const verified=await sigiloQuery(this.env,saved.requestId);
         data={transactionId:verified.id,amount:Math.round(verified.amount*100),paymentMethod:verified.paymentMethod,status:sigiloStatus(verified.status)};
       } else {
@@ -594,6 +651,7 @@ export class PixRequest {
     if (!saved || saved.state !== 'complete') return unavailablePix(saved);
     if (saved.createdAt && Date.now() >= saved.createdAt + SESSION_TTL) return json({error:'Link expirado.'},410);
     if (saved.statusCheckedAt && Date.now() - saved.statusCheckedAt < 15000) return json({ status: saved.response.status, amount: saved.response.amount });
+    if (saved.gateway==='veno') return this.venoRefresh(saved);
     if (saved.gateway==='sigilo') {
       try {
         const data=await sigiloQuery(this.env,saved.requestId);

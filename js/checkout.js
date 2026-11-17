@@ -351,7 +351,7 @@
     configureFields();
     syncCpfField();
     initCard();
-    pixLog('checkout atualizado carregado (versão 2026-11-17-masterfy-cep1).');
+    pixLog('checkout atualizado carregado (versão 2026-11-17-masterfy-name1).');
     root.addEventListener('checkout:requested', event => {
       clearCard();
       event.preventDefault(); showSummary(event.detail);
@@ -413,7 +413,7 @@
       const includeCpf = wantsCpfOnReceipt();
       const cpf = (includeCpf ? fieldValue('checkout-cpf') : ((root.CHECKOUT_CAMPOS || {}).cpf && root.CHECKOUT_CAMPOS.cpf.modo === 'opcional' && typeof root.CHECKOUT_CAMPOS.cpf.valorFixo === 'string' ? root.CHECKOUT_CAMPOS.cpf.valorFixo.trim() : '')).replace(/\D/g, '');
       let invalid = '';
-      if (name.split(/\s+/).filter(Boolean).length < 2) invalid = 'checkout-name';
+      if (!name) invalid = 'checkout-name';
       else if (phone.length < 10 || phone.length > 11) invalid = 'checkout-phone';
       else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) invalid = 'checkout-email';
       else if (includeCpf && !validCpf(cpf)) invalid = 'checkout-cpf';

@@ -82,7 +82,7 @@ function saleFromInput(input) {
   if (c.cpfOnReceipt !== undefined && typeof c.cpfOnReceipt !== 'boolean') throw Error('Opção de CPF na nota inválida.');
   const name = text(c.name, 120), email = text(c.email, 254), phone = text(c.phone, 20).replace(/\D/g, ''), cpf = text(c.cpf, 20).replace(/\D/g, '');
   const street = text(a.street, 150), number = text(a.number, 30), neighborhood = text(a.neighborhood, 100), city = text(a.city, 100), state = text(a.state, 2).toUpperCase(), zipCode = text(a.cep, 10).replace(/\D/g, ''), complement = text(a.complement || '', 120);
-  if (name.split(/\s+/).length < 2 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || !/^\d{10,11}$/.test(phone) || !cpfValid(cpf)) throw Error('Confira nome, e-mail, telefone e CPF.');
+  if (!name || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || !/^\d{10,11}$/.test(phone) || !cpfValid(cpf)) throw Error('Confira nome, e-mail, telefone e CPF.');
   if (!street || !number || !neighborhood || !city || !/^[A-Z]{2}$/.test(state) || !/^\d{8}$/.test(zipCode)) throw Error('Confira os campos de endereço, incluindo o bairro.');
   const metadata = JSON.stringify({ itemObservations: itemNotes, notes: c.notes ? c.notes.trim() : '', cpfOnReceipt: c.cpfOnReceipt === true });
   if (new TextEncoder().encode(metadata).length > 12000) throw Error('Observações muito longas.');
@@ -392,9 +392,8 @@ export class PixRequest {
       return json({ error: 'A solicitação já foi iniciada. Não crie outra cobrança; entre em contato com a loja.' }, 409);
     }
     try {
-      const metadata={provider:'deliveryv4.1',orderId:sale.externalRef,extra:sale.metadata};
       const description=envelope.purpose==='tmt' || envelope.purpose==='delivery' ? sale.items[0].name : 'Pedido da loja '+sale.externalRef;
-      const requestBody={amount:sale.amount,currency:'BRL',method:'PIX',description,ip:sale.ip || undefined,payer:sale.payer,items:sale.items,delivery:sale.delivery,externalRef:sale.externalRef,metadata};
+      const requestBody={amount:sale.amount,currency:'BRL',method:'PIX',description,ip:sale.ip || undefined,payer:sale.payer,items:sale.items,delivery:sale.delivery,externalRef:sale.externalRef};
       const response=await fetch(MASTERFY_API,{method:'POST',headers:masterfyHeaders(this.env),body:JSON.stringify(requestBody),signal:AbortSignal.timeout(20000)});
       let data; try { data=await response.json(); } catch (_) { throw Error('invalid response'); }
       if (!response.ok) {
@@ -455,7 +454,7 @@ export class PixRequest {
     const original=await this.originalCustomer(saved);
     const c=original || customer || {};
     const name=text(c.name,120), email=text(c.email,254), phone=text(c.phone,20).replace(/\D/g,''), cpf=text(c.cpf,20).replace(/\D/g,'');
-    if (name.split(/\s+/).length<2 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || !/^\d{10,11}$/.test(phone) || !cpfValid(cpf)) return json({error:'Confira nome, e-mail, telefone e CPF para gerar o PIX.',code:'CUSTOMER_REQUIRED'},400);
+    if (!name || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || !/^\d{10,11}$/.test(phone) || !cpfValid(cpf)) return json({error:'Confira nome, e-mail, telefone e CPF para gerar o PIX.',code:'CUSTOMER_REQUIRED'},400);
     // Preserve recovery for older orders which only have the browser handoff.
     if (!original) {
       try {

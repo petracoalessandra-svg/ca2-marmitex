@@ -351,7 +351,7 @@
     configureFields();
     syncCpfField();
     initCard();
-    pixLog('checkout atualizado carregado (versão 2026-11-17-masterfy-name1).');
+    pixLog('checkout atualizado carregado (versão 2026-11-17-pix-recover1).');
     root.addEventListener('checkout:requested', event => {
       clearCard();
       event.preventDefault(); showSummary(event.detail);
@@ -413,7 +413,7 @@
       const includeCpf = wantsCpfOnReceipt();
       const cpf = (includeCpf ? fieldValue('checkout-cpf') : ((root.CHECKOUT_CAMPOS || {}).cpf && root.CHECKOUT_CAMPOS.cpf.modo === 'opcional' && typeof root.CHECKOUT_CAMPOS.cpf.valorFixo === 'string' ? root.CHECKOUT_CAMPOS.cpf.valorFixo.trim() : '')).replace(/\D/g, '');
       let invalid = '';
-      if (!name) invalid = 'checkout-name';
+      if (name.split(/\s+/).filter(Boolean).length < 2) invalid = 'checkout-name';
       else if (phone.length < 10 || phone.length > 11) invalid = 'checkout-phone';
       else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) invalid = 'checkout-email';
       else if (includeCpf && !validCpf(cpf)) invalid = 'checkout-cpf';
@@ -496,14 +496,27 @@
           });
           pixLog('consulta da tentativa: HTTP', check.status);
           if (!check.ok) {
-            button.disabled = false;
-            status('checkout-payment-status', 'Não foi possível recuperar esta cobrança (consulta HTTP ' + check.status + '). Confira a venda na Masterfy; não gere outra cobrança.'); return;
-          }
-          const existing = await check.json();
-          pixLog('consulta retornou status pendente e valor correspondente', { pendente: existing.status === 'PENDING', valorCorreto: existing.amount === Math.round(current.total * 100) });
-          if (!['PENDING','PAID'].includes(existing.status) || existing.amount !== Math.round(current.total * 100)) {
-            button.disabled = false;
-            status('checkout-payment-status', 'Confira o status e o valor da cobrança no painel da Masterfy antes de continuar.'); return;
+            let checkFailure = {};
+            try { checkFailure = await check.json(); } catch (_) { /* O Worker pode responder sem JSON. */ }
+            if (check.status === 404 && checkFailure.code === 'PIX_ATTEMPT_NOT_FOUND') {
+              root.sessionStorage.removeItem('checkout_pix_attempt');
+              if (!root.crypto || typeof root.crypto.randomUUID !== 'function') throw Error();
+              attempt = { requestId: root.crypto.randomUUID(), state: 'pending', cartKey };
+              root.sessionStorage.setItem('checkout_pix_attempt', JSON.stringify(attempt));
+              recovering = false;
+              pixLog('tentativa anterior não encontrada; criando nova tentativa');
+              status('checkout-payment-status', 'Tentativa anterior não encontrada. Gerando um novo PIX...');
+            } else {
+              button.disabled = false;
+              status('checkout-payment-status', 'Não foi possível recuperar esta cobrança (consulta HTTP ' + check.status + '). Confira a venda na Masterfy; não gere outra cobrança.'); return;
+            }
+          } else {
+            const existing = await check.json();
+            pixLog('consulta retornou status pendente e valor correspondente', { pendente: existing.status === 'PENDING', valorCorreto: existing.amount === Math.round(current.total * 100) });
+            if (!['PENDING','PAID'].includes(existing.status) || existing.amount !== Math.round(current.total * 100)) {
+              button.disabled = false;
+              status('checkout-payment-status', 'Confira o status e o valor da cobrança no painel da Masterfy antes de continuar.'); return;
+            }
           }
         }
         stage = recovering ? 'recuperação da cobrança' : 'solicitação ao Worker';

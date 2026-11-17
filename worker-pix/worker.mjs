@@ -86,7 +86,7 @@ function saleFromInput(input) {
   if (!street || !number || !neighborhood || !city || !/^[A-Z]{2}$/.test(state) || !/^\d{8}$/.test(zipCode)) throw Error('Confira os campos de endereço, incluindo o bairro.');
   const metadata = JSON.stringify({ itemObservations: itemNotes, notes: c.notes ? c.notes.trim() : '', cpfOnReceipt: c.cpfOnReceipt === true });
   if (new TextEncoder().encode(metadata).length > 12000) throw Error('Observações muito longas.');
-  return { amount, currency: 'BRL', method: 'PIX', items, payer: { name, email, phone: '+55' + phone, taxId: cpf }, delivery: { fee: 0, address: { country: 'BR', state, city, district: neighborhood, street, number, complement, zipCode } }, metadata, externalRef: input.requestId };
+  return { amount, currency: 'BRL', method: 'PIX', items, payer: { name, email, phone: '+55' + phone, taxId: cpf }, delivery: { fee: 0, address: { country: 'BR', state, city, district: neighborhood, street, number, complement, zipCode: zipCode.slice(0,5)+'-'+zipCode.slice(5) } }, metadata, externalRef: input.requestId };
 }
 function allowedOrigin(request, env) {
   const origin = request.headers.get('Origin');
@@ -392,13 +392,19 @@ export class PixRequest {
       return json({ error: 'A solicitação já foi iniciada. Não crie outra cobrança; entre em contato com a loja.' }, 409);
     }
     try {
-      const metadata={provider:'deliveryv4.1',orderId:sale.externalRef,extra:JSON.parse(sale.metadata)};
+      const metadata={provider:'deliveryv4.1',orderId:sale.externalRef,extra:sale.metadata};
       const description=envelope.purpose==='tmt' || envelope.purpose==='delivery' ? sale.items[0].name : 'Pedido da loja '+sale.externalRef;
       const requestBody={amount:sale.amount,currency:'BRL',method:'PIX',description,ip:sale.ip || undefined,payer:sale.payer,items:sale.items,delivery:sale.delivery,externalRef:sale.externalRef,metadata};
       const response=await fetch(MASTERFY_API,{method:'POST',headers:masterfyHeaders(this.env),body:JSON.stringify(requestBody),signal:AbortSignal.timeout(20000)});
       let data; try { data=await response.json(); } catch (_) { throw Error('invalid response'); }
       if (!response.ok) {
-        if (response.status>=400 && response.status<500 && ![408,409,429].includes(response.status)) {await this.state.storage.delete('sale');return json({error:typeof data.message==='string'?data.message.slice(0,300):'Cobrança recusada.'},400);}
+        if (response.status>=400 && response.status<500 && ![408,409,429].includes(response.status)) {
+          const providerCode=typeof data.code==='string'?data.code:'';
+          const fields=data.details && typeof data.details==='object' && !Array.isArray(data.details)?Object.keys(data.details).slice(0,30):[];
+          console.log(JSON.stringify({event:'masterfy_payment_rejected',status:response.status,code:providerCode,fields}));
+          await this.state.storage.delete('sale');
+          return json({error:typeof data.message==='string'?data.message.slice(0,300):'Cobrança recusada.',code:providerCode,fields},400);
+        }
         throw Error('uncertain gateway error');
       }
       const copyPaste=data && data.data && data.data.copypaste;

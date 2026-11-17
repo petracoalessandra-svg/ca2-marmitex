@@ -351,7 +351,7 @@
     configureFields();
     syncCpfField();
     initCard();
-    pixLog('checkout atualizado carregado (versão 2026-10-27-4).');
+    pixLog('checkout atualizado carregado (versão 2026-11-17-masterfy-cep1).');
     root.addEventListener('checkout:requested', event => {
       clearCard();
       event.preventDefault(); showSummary(event.detail);
@@ -515,6 +515,9 @@
         });
         pixLog(recovering ? 'recuperação da cobrança: HTTP' : 'solicitação ao Worker: HTTP', response.status);
         if (!response.ok) {
+          let failure = {};
+          try { failure = await response.json(); } catch (_) { /* O Worker pode responder sem JSON. */ }
+          if (failure.code || failure.error || Array.isArray(failure.fields)) pixLog('validação da Masterfy', { code: failure.code || '', message: typeof failure.error === 'string' ? failure.error.slice(0, 180) : '', fields: Array.isArray(failure.fields) ? failure.fields : [] });
           if (!recovering && response.status >= 400 && response.status < 500 && ![408, 409, 429].includes(response.status)) {
             root.sessionStorage.removeItem('checkout_pix_attempt');
             button.disabled = false;

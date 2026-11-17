@@ -351,7 +351,7 @@
     configureFields();
     syncCpfField();
     initCard();
-    pixLog('checkout atualizado carregado (versão 2026-11-06-pix-recovery).');
+    pixLog('checkout atualizado carregado (versão 2026-10-27-4).');
     root.addEventListener('checkout:requested', event => {
       clearCard();
       event.preventDefault(); showSummary(event.detail);
@@ -488,50 +488,38 @@
       pixRequestInFlight = true;
       button.disabled = true;
       status('checkout-payment-status', recovering ? 'Verificando a cobrança existente...' : 'Gerando PIX...');
-      let stage = recovering ? 'recuperação da cobrança' : 'solicitação ao Worker';
+      let stage = recovering ? 'consulta da tentativa' : 'solicitação ao Worker';
       try {
-        let response, failure;
         if (recovering) {
-          // Recover the saved PIX directly. A provider status outage must not
-          // prevent a customer from opening a code already created and saved.
-          response = await root.fetch(new URL('/api/pix/recover', root.PIX_API_BASE_URL).href, {
+          const check = await root.fetch(new URL('/api/pix/status', root.PIX_API_BASE_URL).href, {
             method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ requestId: attempt.requestId })
           });
-          if (!response.ok) {
-            try { failure=await response.json(); } catch (_) { failure=null; }
-            if (response.status===404 && failure && failure.code==='PIX_NOT_STARTED') {
-              // Keep the SAME ID: the Worker reserves it atomically before
-              // calling Blackcat, including a delayed original request.
-              recovering=false;
-              response=null;
-              failure=null;
-              status('checkout-payment-status','Gerando PIX...');
-            }
+          pixLog('consulta da tentativa: HTTP', check.status);
+          if (!check.ok) {
+            button.disabled = false;
+            status('checkout-payment-status', 'Não foi possível recuperar esta cobrança (consulta HTTP ' + check.status + '). Confira a venda na Masterfy; não gere outra cobrança.'); return;
+          }
+          const existing = await check.json();
+          pixLog('consulta retornou status pendente e valor correspondente', { pendente: existing.status === 'PENDING', valorCorreto: existing.amount === Math.round(current.total * 100) });
+          if (!['PENDING','PAID'].includes(existing.status) || existing.amount !== Math.round(current.total * 100)) {
+            button.disabled = false;
+            status('checkout-payment-status', 'Confira o status e o valor da cobrança no painel da Masterfy antes de continuar.'); return;
           }
         }
         stage = recovering ? 'recuperação da cobrança' : 'solicitação ao Worker';
-        if (!response) {
-          const requestBody = { items: current.items.map(item => ({ name: item.name, quantity: item.quantity, observation: item.observation || '' })), customer, address, requestId: attempt.requestId, tracking: root.MetaTracking ? root.MetaTracking.attribution() : {} };
-          response = await root.fetch(endpoint.href, {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },body: JSON.stringify(requestBody)
-          });
-        }
+        const requestUrl = recovering ? new URL('/api/pix/recover', root.PIX_API_BASE_URL).href : endpoint.href;
+        const requestBody = recovering ? { requestId: attempt.requestId } : { items: current.items.map(item => ({ name: item.name, quantity: item.quantity, observation: item.observation || '' })), customer, address, requestId: attempt.requestId, tracking: root.MetaTracking ? root.MetaTracking.attribution() : {} };
+        const response = await root.fetch(requestUrl, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(requestBody)
+        });
         pixLog(recovering ? 'recuperação da cobrança: HTTP' : 'solicitação ao Worker: HTTP', response.status);
         if (!response.ok) {
-          if (!failure) { try { failure=await response.json(); } catch (_) { failure=null; } }
-          if (failure && failure.code==='PIX_PROCESSING') {
-            status('checkout-payment-status','A geração do PIX ainda está em processamento. Aguarde alguns segundos e tente novamente para recuperar a mesma cobrança.');
-          } else if (failure && failure.code==='PIX_UNCERTAIN') {
-            const diagnostic=failure.diagnostic || {};
-            const http=Number.isInteger(diagnostic.httpStatus) && diagnostic.httpStatus>=100 && diagnostic.httpStatus<=599 ? ' (HTTP '+diagnostic.httpStatus+')' : '';
-            const provider=diagnostic.gateway==='sigilo' ? 'Sigilo Pay' : diagnostic.gateway==='blackcat' ? 'Blackcat' : 'gateway';
-            const detail=diagnostic.stage==='pix_code' ? 'O '+provider+' respondeu sem um código PIX utilizável.' : diagnostic.stage==='provider_response' ? 'O '+provider+' não confirmou a geração do PIX'+http+'.' : 'Não foi possível confirmar a resposta da geração do PIX.';
-            status('checkout-payment-status',detail+' Confira a transação nos gateways e tente recuperar este mesmo pedido; não gere outra cobrança.');
-          } else if (!recovering && response.status >= 400 && response.status < 500 && ![408, 409, 429].includes(response.status)) {
+          if (!recovering && response.status >= 400 && response.status < 500 && ![408, 409, 429].includes(response.status)) {
             root.sessionStorage.removeItem('checkout_pix_attempt');
+            button.disabled = false;
             status('checkout-payment-status', 'Não foi possível gerar o PIX. Confira os dados e tente novamente.');
-          } else { status('checkout-payment-status', 'Não foi possível recuperar a cobrança (HTTP ' + response.status + '). Confira a venda na Blackcat; não gere outra cobrança.'); }
-          button.disabled = false;
+          } else { button.disabled = false; status('checkout-payment-status', 'Não foi possível recuperar a cobrança (HTTP ' + response.status + '). Confira a venda na Masterfy; não gere outra cobrança.'); }
           return;
         }
         stage = 'validação da resposta';
@@ -566,7 +554,7 @@
         pixLog('falha na etapa', stage);
         pixLog('tipo de erro', error && ['TypeError', 'SyntaxError', 'AbortError'].includes(error.name) ? error.name : 'Erro');
         button.disabled = false;
-        status('checkout-payment-status', 'Não foi possível concluir a ' + stage + '. Confira a venda na Blackcat; não gere outra cobrança.');
+        status('checkout-payment-status', 'Não foi possível concluir a ' + stage + '. Confira a venda na Masterfy; não gere outra cobrança.');
       } finally {
         pixRequestInFlight = false;
       }

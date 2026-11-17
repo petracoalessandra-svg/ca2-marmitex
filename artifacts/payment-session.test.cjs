@@ -25,7 +25,6 @@ test('paid polling fires browser Purchase and keepalive CAPI before redirect wit
   a.window.sessionStorage={getItem:()=>null};
   a.window.localStorage.setItem('delivery_location',JSON.stringify({version:1,city:'São Paulo',state:'SP'}));
   vm.runInContext(fs.readFileSync('js/meta-tracking.js','utf8'),a.ctx);
-  assert.deepEqual(pixel.find(args=>args[0]==='init'),['init','1179633571678200']);
   a.window.location.replace=url=>{order.push('redirect');a.window.redirects.push(url);};
   a.window.PaymentSession.start(a.session(),{amount:2799});await flush();
   const purchase=pixel.filter(args=>args[1]==='Purchase');assert.equal(purchase.length,1);

@@ -1,120 +1,37 @@
-# Gateway atual: VenoPag
+# Worker de pagamentos
 
-Novas cobranças PIX usam a VenoPag em `https://venopagments.com`; os caminhos de consulta e webhook antigos permanecem para cobranças já criadas na Sigilo e na Blackcat. O navegador continua usando o mesmo contrato do Worker. Não há deploy automático.
+## Gateway Masterfy
 
-Antes da publicação manual, configure no Worker os secrets `VENO_CLIENT_ID`, `VENO_CLIENT_SECRET` e `VENO_WEBHOOK_SECRET` pelo painel da Cloudflare. Configure também `PUBLIC_WORKER_URL` com a URL pública do Worker e mantenha os bindings e secrets existentes necessários para sessões e cobranças anteriores. Não coloque credenciais em arquivos, código do navegador ou repositório. Como as credenciais foram compartilhadas no chat, recomenda-se gerar novas no painel da VenoPag e usar as novas no Worker.
+Novas cobranças PIX são criadas pelo Worker em `POST https://api.masterfypagamentos.com/v1/payment`. A chave privada fica somente nos secrets do Worker Cloudflare. Configure `MASTERFY_API_KEY` e `MASTERFY_WEBHOOK_SECRET` no painel; não coloque esses valores no repositório, no frontend ou em comandos registrados.
 
-Cada cobrança informa a URL `https://conta2dlv31.ulissonsilvera88.workers.dev/api/venopag/webhook?id=<UUID>` (o domínio é derivado de `PUBLIC_WORKER_URL`). O webhook valida o HMAC do corpo original, o Client ID e a janela de cinco minutos; a transação e o valor são confirmados por consulta autenticada antes de alterar o estado. O estado é idempotente por cobrança e confirmado novamente na VenoPag, inclusive para reversões e confirmação após expiração. Preserve os webhooks e as credenciais antigos até reconciliar as cobranças anteriores.
+No painel Masterfy, registre o webhook de pagamentos apontando para `https://marmita.laura66hg.workers.dev/api/masterfy/webhook` (ou para o domínio público atual do Worker) e habilite os eventos `payment.created`, `payment.paid`, `payment.refused` e `payment.refunded`. Configure o mesmo segredo de assinatura no Worker como `MASTERFY_WEBHOOK_SECRET`. O Worker verifica `X-Signature` como HMAC-SHA256 em Base64 sobre o corpo JSON original. Notificações enviadas por `notificationUrl` não carregam essa assinatura, por isso a integração usa o webhook registrado no painel e não envia `notificationUrl` na criação.
 
-Se a resposta da criação for perdida, inválida ou indicar erro, a tentativa fica bloqueada como incerta: a VenoPag não documenta pesquisa de cobrança pelo UUID local, portanto confira o painel antes de criar outra. A integração não faz uma segunda cobrança automaticamente. A validade vem de `expire_minutes`; os limites são definidos pela VenoPag. Antes de receber pedidos, publique manualmente o Worker e valide o fluxo com uma cobrança real controlada, incluindo webhook e confirmação. A URL de produção é a única documentada; não foi feito teste real nem deploy.
+O adaptador mantém o contrato do site (`transactionId`, `status`, `amount` e `paymentData.copyPaste`), valida os valores no servidor e envia itens, dados do pagador, endereço de entrega e IP recebido pelo Worker. O QR é criado no site a partir do código PIX. Estados do pagamento são atualizados pelo webhook e salvos no Durable Object; `POST /api/pix/status` e sessões/taxas apenas leem o estado local e não consultam a API de pagamento. A Masterfy exige webhook para acompanhar mudanças; não implemente polling em `GET /v1/payment/:id`.
 
-Teste local: `node --test worker-pix/venopag.test.mjs`. As seções abaixo registram o histórico de integrações anteriores e não descrevem a criação atual.
+O identificador UUID do pedido é enviado como `externalRef`; a criação continua idempotente. Se houver erro de rede ou resposta inconclusiva, a cobrança não é criada novamente automaticamente. O estado é armazenado antes do rastreamento da Meta. Eventos repetidos são tratados de forma idempotente.
 
----
+`POST /api/pix` recebe `{requestId, items:[{name,quantity,observation?}], customer:{name,email,phone,cpf,notes?,cpfOnReceipt?}, address:{street,number,complement,neighborhood,city,state,cep}, tracking?}`. Os preços e o total são calculados pelo catálogo do servidor, não pelo navegador. Pagamentos de pedidos e taxas adicionais usam PIX. As rotas de TMT e taxa de entrega mantêm seus valores e validações próprios.
 
-# Worker PIX
+### Publicação
 
-## Gateway ativo: Sigilo Pay
+- Preserve os bindings já declarados em `wrangler.toml`: `PIX_REQUESTS`, `PAYMENT_SESSIONS`, os rate limiters e o Secret Store da Meta.
+- Configure os secrets `MASTERFY_API_KEY`, `MASTERFY_WEBHOOK_SECRET`, `META_ACCESS_TOKEN`, `TMT_CUSTOMER_KEY` e `SUPABASE_SECRET_KEY` diretamente no Cloudflare, conforme os recursos que já estão ativos.
+- O destino do site é definido em `js/pix-config.js`; ele deve apontar para o Worker publicado.
+- Registre o endpoint do webhook e confira a assinatura no painel Masterfy antes de aceitar pagamentos reais. Nenhum segredo, cadastro de webhook ou deploy remoto pode ser configurado por este repositório.
+- Registros antigos da Blackcat/VenoPag continuam identificados no Durable Object para recuperação de pagamentos iniciados antes da troca. As novas cobranças usam exclusivamente Masterfy.
 
-Novos PIX são criados exclusivamente pela Sigilo Pay, inclusive os das taxas. Não há seleção por conversão nem tentativa em outro gateway. Configure SIGILO_PUBLIC_KEY e SIGILO_SECRET_KEY como secrets e PUBLIC_WORKER_URL como variável do Worker. O callback é POST /api/sigilo/webhook. Não coloque as chaves no código ou navegador.
+## TMT e taxa de entrega
 
-Se a geração falhar ou expirar, a tentativa é preservada como incerta, sem criar outro PIX automaticamente. A recuperação consulta a Sigilo pelo identificador e só devolve a cobrança após verificar valor, moeda, status e código. Se não conseguir comprová-la, confira no painel da Sigilo antes de qualquer nova tentativa.
+O token de sessão continua sendo emitido pelo Worker e validado pelo Durable Object. A TMT custa R$ 9,90; a taxa de entrega custa R$ 7,90 e só pode ser gerada após a confirmação das etapas anteriores. Cada taxa tem identificador idempotente próprio e não altera o valor nem os itens da sacola original.
 
-A consulta e o webhook da Blackcat permanecem apenas para confirmar cobranças antigas já geradas. Preserve o secret Blackcat e o webhook antigo enquanto houver pagamentos anteriores a reconciliar.
+## Rastreamento
 
-Para publicação manual, envie worker.mjs ao Worker compatível com wrangler.toml e confira os bindings e secrets existentes. Copiar o arquivo não cria recursos. Os testes específicos são executados com node --test worker-pix/sigilo-only.test.mjs.
+O Worker mantém o Pixel 4491668551074059 e a Conversions API. O evento Purchase do servidor usa o valor e o identificador do pedido confirmado, com dados de correspondência guardados no Durable Object. Dados de navegação e cliente continuam sujeitos às regras já implementadas em `worker.mjs`.
 
-> As seções históricas abaixo foram escritas para a integração anterior. Referências à criação, fallback, seleção ou webhook padrão da Blackcat não descrevem os novos PIX. Os testes antigos worker.test.mjs também pressupõem criação na Blackcat e precisam ser migrados.
-## Cadastro do pet no Supabase
+## Cadastro do pet
 
-Antes do deploy manual, execute `worker-pix/supabase-pet-registrations.sql` no SQL Editor do projeto Supabase. O arquivo cria `public.pet_registrations` com identificação, nome, validade da vacinação, código, identificação da carteira de vacina, endereço de cobrança e parcelamento. A tabela tem RLS ativo e não permite acesso direto pelos papéis públicos.
+Antes de usar a gravação do cadastro, execute `supabase-pet-registrations.sql` no SQL Editor do Supabase e configure `SUPABASE_SECRET_KEY` como secret do Worker. A página envia os dados ao Worker, que valida e grava no Supabase. Nenhuma chave Supabase deve ser incluída no site.
 
-Configure `SUPABASE_SECRET_KEY` como secret do Worker no painel Cloudflare. `SUPABASE_URL` já está em `wrangler.toml`. A chave publicável não é necessária: o navegador envia os dados para `POST /api/pet-registration` no Worker, que valida e grava no Supabase. Nenhuma chave Supabase deve ser colocada nos arquivos do site ou no repositório. O botão “Continuar” dessa etapa apenas salva os dados e mostra confirmação; a página de agendamento será implementada depois.
+## Catálogo
 
-Este Worker guarda a chave privada como secret da Cloudflare (`BLACKCAT_API_KEY`) e nunca a envia ao navegador. Não armazene chaves neste projeto, no Git, no histórico de comandos nem no cliente. A chave de produção compartilhada anteriormente deve ser revogada e substituída. Nenhuma cobrança é criada nos testes locais.
-
-## Configuração antes de publicar
-
-O frontend usa `https://conta2dlv31.ulissonsilvera88.workers.dev` para PIX, sessões de pagamento, taxas, cadastro e CAPI. O nome do alvo em `wrangler.toml` é `conta2dlv31`. Os IDs de KV e Secrets Store nesse arquivo vieram da configuração anterior: confirme os recursos da conta de destino antes de usar Wrangler; trocar a URL não migra bindings, secrets nem cobranças existentes. Para edição pelo painel, publique `worker.mjs` no Worker de destino e confira seus bindings. Atualize também o webhook da Blackcat para `https://conta2dlv31.ulissonsilvera88.workers.dev/api/blackcat/webhook`. As páginas HTML usam a versão `20261106-conta2dlv31` dos scripts `pix-config.js` e `meta-tracking.js` para renovar o cache.
-
-- O alvo configurado é o Worker existente `conta2dlv31`. `ALLOWED_ORIGINS = "*"` permite chamadas de qualquer domínio. Configure a chave nova como secret `BLACKCAT_API_KEY` diretamente no painel Cloudflare, sem enviá-la pelo chat. Consulte https://developers.cloudflare.com/workers/configuration/secrets/ ; `wrangler secret put` pode publicar uma nova versão imediatamente.
-- O Worker usa Durable Objects e o binding `PIX_RATE_LIMITER`; confirme disponibilidade na conta. O rate limiter da Cloudflare é aproximado e não substitui WAF/controle antiabuso e monitoramento em produção. `ALLOWED_ORIGINS` é proteção de navegador, não autenticação de clientes.
-- Publique apenas após configurar a conta, domínio, chave nova, controle antiabuso e acordar um teste autorizado. Nunca use dados de clientes reais para testar.
-- `worker.mjs` é o único arquivo de código necessário no editor da Cloudflare; os preços estão nele. O comando `node worker-pix/generate-catalog.cjs` atualiza esse bloco a partir de `js/produto-data.js` e é executado também no build. Quando alterar produtos ou preços, atualize e publique novamente o Worker. Mini Pudim custa R$ 5 e é definido no gerador. Um teste verifica equivalência.
-- Colar o código no editor não configura os recursos automaticamente: o Worker também precisa de `ALLOWED_ORIGINS`, do Durable Object `PIX_REQUESTS` (classe `PixRequest` e migração SQLite) e do rate limiter `PIX_RATE_LIMITER`. O arquivo `wrangler.toml` declara os recursos para deploy com Wrangler; se usar o painel, configure-os conforme as opções da Cloudflare. A URL em `js/pix-config.js` só deve ser preenchida após o Worker estar configurado e verificado.
-
-## Contrato HTTP
-
-### Correção de recuperação PIX — 06/11/2026
-
-Para ativar manualmente, publique primeiro `worker-pix/worker.mjs` no Worker **conta2dlv31**, preservando os bindings, namespaces, secrets e registros existentes. Depois envie `js/checkout.js` e `carrinho.html` à hospedagem. O HTML aponta para a versão `20261106-pix-recovery1` para atualizar o cache do checkout. O arquivo `worker-cloudflare-corrigido.txt` é uma cópia antiga e não contém esta correção. Não houve mudança na configuração ou no comportamento do CPF.
-
-O checkout agora recupera diretamente o PIX salvo em `/api/pix/recover`, sem exigir uma consulta extra de status à Blackcat antes de exibir o código. O pagamento continua sendo confirmado pela consulta autenticada já existente. O Worker distingue:
-
-- `404 / PIX_NOT_STARTED`: nenhuma reserva dessa tentativa existe no Durable Object. O checkout pode reenviar o pedido completo com **o mesmo requestId**. A reserva atômica antes da chamada à Blackcat impede duplicidade se a requisição original chegar atrasada.
-- `409 / PIX_PROCESSING`: a reserva existe e a solicitação está em andamento. Tentar recuperar novamente não cria outra cobrança.
-- `409 / PIX_UNCERTAIN`: a chamada foi iniciada, mas seu resultado não foi confirmado. A tentativa permanece preservada para conferência. Um 404 genérico de versões antigas nunca autoriza recriação.
-
-Quando a Sigilo Pay foi tentada e não entregou resposta válida (por exemplo, HTTP 503), a recuperação de uma tentativa nova consulta `GET /transactions?clientIdentifier=...` com o mesmo identificador. Se a Sigilo confirmar transação PIX em BRL, com valor correto e QR Code utilizável, o Worker devolve essa cobrança sem emitir outra criação. Se a consulta também falhar ou não comprovar esses campos, a tentativa continua incerta. O recurso depende dos dados de recuperação gravados pela versão nova do Worker; tentativas incertas anteriores à publicação continuam exigindo conferência nos painéis. O texto do checkout agora identifica o gateway que retornou o diagnóstico, sem atribuir sempre a falha à Blackcat. Um HTTP 503 da Sigilo não pode ser corrigido pelo código do site: é preciso verificar disponibilidade, credenciais e resposta da API com o provedor.
-
-Uma imagem de QR ausente ou inválida não descarta um código copia e cola válido; a página de pagamento já gera o QR localmente. Valor, ID, método e status da cobrança continuam sendo validados.
-
-Falhas novas de criação registram o evento `pix_creation_failed` nos logs do Worker, com `stage`, `httpStatus` e `providerStatus`, sem CPF, nome, e-mail, chave, resposta bruta ou código PIX. `provider_request` indica falha/timeout antes de obter resposta; `provider_json`, resposta sem JSON válido; `provider_response`, HTTP sem sucesso ou recusa; `payment_identity`, inconsistência no ID/método/valor/status; `pix_code`, ausência de código utilizável; `payment_storage`, falha ao persistir a cobrança. Esses campos também acompanham a recuperação incerta. Os registros novos preservam o ID da transação, quando retornado, no Durable Object para conferência administrativa.
-
-Tentativas antigas marcadas como `uncertain` não guardavam o retorno nem o ID da Blackcat. Não é possível reconstruí-las automaticamente usando apenas esse registro; confirme a venda no gateway antes de liberar outra tentativa. A publicação corrige os casos recuperáveis e dá diagnóstico às próximas falhas, mas não comprova a causa inicial de uma falha antiga.
-
-`POST /api/pix` recebe JSON com `requestId` (UUID v4 aleatório), `items` (array de `{name,quantity}`), `customer` (`name,email,phone,cpf`) e `address` (`street,number,complement,neighborhood,city,state,cep`). Todos os produtos são físicos. O Worker valida CPF, endereço e catálogo; preços enviados pelo cliente são ignorados. A Blackcat exige CPF e bairro mesmo quando a nota fiscal com CPF não for solicitada. Não enviar dados falsos para contornar essa exigência.
-
-Opcionalmente, cada item aceita `observation` (até 1000 caracteres), e `customer` aceita `notes` (até 500 caracteres) e `cpfOnReceipt` (booleano). Esses dados são enviados à Blackcat no campo `metadata`, como JSON com `itemObservations` na mesma ordem dos itens, `notes` e `cpfOnReceipt`; a representação não pode ultrapassar 12000 bytes. O Durable Object mantém o hash da solicitação, os dados da cobrança e dados de correspondência da Meta: hashes de nome, e-mail, telefone e localização e, quando disponíveis, cookies, IP e user agent. As observações não são armazenadas. Nome, e-mail, telefone e CPF necessários à TMT são armazenados temporariamente, criptografados com AES-256-GCM, no registro do pedido original, por até 24 horas. Esses campos não são retornados ao navegador nem gravados no KV.
-
-Resposta: `{transactionId,status,amount,paymentData:{copyPaste,qrCodeBase64,expiresAt}}`, valor em centavos. O mesmo UUID e conteúdo reutilizam a resposta salva; outro conteúdo retorna 409. Se a resposta da Blackcat não puder ser confirmada, o UUID permanece bloqueado: não gerar nova cobrança automaticamente; conferir no painel da Blackcat. O identificador `requestId` é usado no contrato legado; no fluxo novo, o link de acesso inclui também 256 bits aleatórios e exige a validação do hash no servidor. Não registrar o link completo em logs ou analytics. Não apague ou substitua automaticamente o identificador diante de erro incerto.
-
-`POST /api/pix/status` recebe `{requestId}` e responde `{status,amount}`. O estado vem de consulta autenticada à Blackcat e é atualizado no máximo uma vez por 15 segundos por cobrança. A resposta nunca contém CPF, endereço ou nome. O webhook de pagamento está implementado; rastreio real de entrega ainda não está integrado.
-
-Teste: `node --test worker-pix/worker.test.mjs` executado a partir da raiz do projeto. Os testes fazem mocks e não acessam a Blackcat. Para produção, valide autenticação, criação, resposta real e estados com credenciais e ambiente de teste fornecidos pela Blackcat antes de liberar transações.
-
-## Meta Pixel e Conversions API
-
-O Pixel 1179633571678200 acompanha PageView, ViewContent, AddToCart, InitiateCheckout, Lead, AddPaymentInfo e Purchase. O Worker envia cópias para a Conversions API com o mesmo event ID quando há pelo menos um dado de correspondência do cliente (e-mail, telefone, nome, cidade, estado ou CEP); eventos de navegação anônimos continuam somente no Pixel. Purchase exige que o status consultado da Blackcat seja PAID e usa os hashes guardados com o pedido confirmado no Durable Object, mesmo quando o navegador abriu o pagamento em outra aba e perdeu o `sessionStorage`. A cidade e o estado escolhidos pelo visitante em `delivery_location` podem acompanhar eventos antes do checkout. Dados informados (nome, e-mail, telefone, cidade, estado e CEP) são normalizados e enviados como hashes SHA-256; CPF e observações não são enviados. Os dados de correspondência são mantidos na sessão do navegador e, para novos pedidos, os hashes e identificadores técnicos são persistidos no Durable Object para processar a confirmação via webhook. IP, user agent e cookies da Meta são enviados quando disponíveis, mas isoladamente não autorizam o envio CAPI. URLs são enviadas sem parâmetros ou fragmentos.
-
-Atualize o valor do secret `META_ACCESS_TOKEN` no Secrets Store da Cloudflare. O binding existente em `wrangler.toml` aponta para esse secret; confirme que o Worker `conta2dlv31` usa esse binding. Não inclua o token no código ou nos comandos registrados. Publique `worker-pix/worker.mjs` e `js/meta-tracking.js` para ativar o novo Pixel no servidor e no navegador. `ALLOWED_ORIGINS = "*"` está configurado por solicitação do usuário e aceita qualquer domínio. Após publicar o Worker, configure o webhook padrão para /api/blackcat/webhook e selecione transaction.paid. O Worker confirma a transação pela API Blackcat antes de enviar Purchase à Meta. O webhook processa pedidos novos que possuam dados de correspondência armazenados. Em falhas ele responde com erro para permitir reenvio; confirme com a Blackcat se e quando ela reenvia notificações. Confira os eventos, a deduplicação e a qualidade de correspondência no Gerenciador de Eventos da Meta após a publicação.
-## Sessões de pagamento e TMT
-
-O Worker usa `PAYMENT_SESSIONS` (KV), `PIX_REQUESTS` (Durable Object) e o limite independente `PIX_STATUS_RATE_LIMITER`. O namespace KV foi criado e está declarado em `wrangler.toml`. O binding existente de Secrets Store da Meta é preservado; a chave Blackcat continua como secret do Worker.
-
-Criação e recuperação retornam `sessionToken` e `sessionExpiresAt` para cobranças novas. O token contém a referência UUID e 32 bytes aleatórios; somente hashes são persistidos. Cada recuperação pode emitir outro token, sem criar outra cobrança nem renovar as 24 horas. Cobranças antigas sem timestamp mantêm o contrato anterior, sem emitir uma sessão de idade desconhecida.
-
-`POST /api/payment-session/status` e `POST /api/payment-session/open` recebem `{ "token": "..." }`. A resposta contém `orderReference`, `status`, `amount` (centavos), `expiresAt`, `pollAfterMs`, `serverNow` e `tmtExpiresAt`. O endpoint de abertura exige pagamento confirmado para retornar dados reais e definir o timer de dez minutos atomicamente. A página tmt.html é pública: abre sem token ou confirmação, inicia um timer local persistente e usa os dados do servidor quando disponíveis; falhas de verificação não ocultam seu conteúdo. `401` indica token inválido, `410` expiração e `409` pagamento não confirmado/estornado. Respostas não são cacheáveis. O KV mantém contexto por hash, recibos `paid:`, estados `terminal:` e prazo `opened:`; o DO valida o acesso e coordena a reconciliação para evitar depender da propagação do KV ou ignorar estornos.
-
-O frontend é controlado por `PAYMENT_SESSION_ENABLED` em `js/pix-config.js`. O link recuperável é `pagamento.html#token=...`; o destino fixo é `tmt.html`, carregando o token apenas no fragmento e os cinco parâmetros UTM permitidos na query. O link dá acesso ao estado mínimo do pedido: não o inclua em logs ou eventos de publicidade. `_headers` aplica cabeçalhos nas hospedagens que suportam esse formato; em outras hospedagens, configure `Cache-Control: no-store` e `Referrer-Policy: no-referrer` nas duas páginas. As páginas também incluem a política de referrer em meta.
-
-Antes de ativar em produção, envie os arquivos HTML/JS atualizados à hospedagem e confirme na Blackcat o webhook `https://conta2dlv31.ulissonsilvera88.workers.dev/api/blackcat/webhook`, evento `transaction.paid`, com reenvio em falhas. A configuração no gateway e um pagamento real não foram verificados automaticamente. Não é necessário criar uma cobrança para testar rejeição de tokens inválidos. O botão da taxa adicional abre pagamento-tmt.html, integrado aos endpoints de TMT descritos abaixo.
-
-O webhook persiste pagamento antes da Meta. Se o envio do evento falhar, responde com erro para permitir repetição, mas polling e redirecionamento continuam disponíveis. Na ausência de webhook, o polling reconcilia pela Blackcat a cada quinze segundos, no máximo. Ao confirmar PAID, o frontend dispara Purchase no Pixel e na CAPI pelo MetaTracking existente antes de redirecionar, usando o mesmo UUID/event_id do webhook. A chamada CAPI usa keepalive; falhas de rastreamento não impedem a navegação. Uma aba visível consulta o Worker a cada seis segundos com jitter e backoff; abas ocultas retomam ao voltar. Nenhum navegador fechado/offline pode redirecionar até ser reaberto/reconectado.
-
-Validação: `node --test worker-pix/worker.test.mjs artifacts/payment-session.test.cjs artifacts/product-flow.test.cjs artifacts/cart-flow.test.cjs artifacts/payment-flow.test.cjs artifacts/checkout-flow.test.cjs`.
-
-Rollback do frontend: definir `PAYMENT_SESSION_ENABLED = false`. Não apagar namespaces ou registros de cobrança. A versão anterior à mudança do Worker é `3e1799f4-2e70-4c8a-9ee5-6d6849a4c21e`; avaliar compatibilidade antes de restaurá-la, pois não oferece os endpoints novos.
-
-
-## PIX da TMT
-
-O botão da TMT abre `/pagamento-tmt.html` com o mesmo token no fragmento e somente os parâmetros UTM permitidos. `POST /api/tmt/pix` recebe `{token, customer?}`; o Worker autentica o pedido original e exige PAID antes de gerar uma cobrança adicional de exatamente 990 centavos. A descrição é Taxa de Manipulação e Transporte, quantidade 1, serviço sem novo envio físico. O cliente não controla preço ou quantidade. `POST /api/tmt/status` recebe `{token}` e consulta a cobrança vinculada.
-
-O Durable Object do pedido reserva um único feeRequestId; o PIX adicional reutiliza a criação, a recuperação e a proteção de idempotência já existentes. Respostas incluem feeRequestId, amount e status, além de paymentData na criação/recuperação. Após uma falha incerta, nunca é criada outra cobrança automaticamente. O valor do pedido original e a sacola não são alterados.
-
-Para novos pedidos, o Worker retém no próprio Durable Object os quatro campos necessários do cliente (nome, e-mail, telefone e CPF), criptografados com AES-256-GCM e vinculados ao requestId e à validade original de 24 horas. A chave dedicada TMT_CUSTOMER_KEY é um secret Cloudflare de 32 bytes em hexadecimal; não é armazenada no código ou no KV e sua rotação precisa preservar a leitura dos registros ainda válidos. Um alarme remove o contexto expirado sem apagar a cobrança ou os dados de rastreamento. A criptografia não adiciona chamadas externas à criação do PIX; falhas de captura não alteram a resposta do primeiro pagamento e registram apenas diagnóstico sem dados pessoais.
-
-A TMT solicita a geração usando primeiro somente o token. O servidor recupera os dados originais e ignora alterações enviadas pelo navegador quando esse contexto existe. A cópia no sessionStorage e o formulário permanecem exclusivamente como compatibilidade para pedidos anteriores sem contexto no servidor. Se esses pedidos ainda possuírem o handoff no navegador, o Worker o armazena criptografado no pedido ao gerar a TMT, sem renovar sua validade. Uma cobrança adicional já criada continua sendo recuperada sem reenviar dados. Nenhum dado fictício é gerado.
-
-A página usa o mesmo gerador de QR Code e a mesma integração Blackcat. PAID da TMT, confirmado pelo endpoint de status, registra Purchase com o feeRequestId e R$ 9,90 e redireciona para `/taxa-entrega.html`, preservando somente o token no fragmento e as cinco UTMs permitidas. O webhook usa o mesmo ID para deduplicação. Confirmar a TMT não aciona despacho ou envio automaticamente.
-
-## PIX da taxa de entrega
-
-`POST /api/entrega/pix` e `POST /api/entrega/status` recebem `{token}`. O Worker exige que o pedido original e a TMT estejam confirmados antes de gerar ou consultar a cobrança de entrega. Reserva um `deliveryRequestId` independente dos UUIDs do pedido e da TMT, com preço fixo de **790 centavos** e descrição “Taxa de Entrega”. O cliente não escolhe preço, itens ou quantidade. O mesmo ID é recuperado em tentativas posteriores; falha incerta não gera outra cobrança. Respostas expõem `feeRequestId` como campo comum das duas taxas, mas o valor nele é o ID específico da etapa.
-
-`/taxa-entrega.html` gera o QR Code e o código de copiar e colar, consulta somente `/api/entrega/status` e confirma somente uma resposta com 790 centavos e o ID próprio da entrega. O mapa usa o endereço do resumo de pagamento ainda disponível no `sessionStorage` do mesmo navegador. Se esse resumo não estiver disponível, a página não exibe endereço ou mapa sem fonte verificada. Após PAID da entrega, a página mostra a confirmação; nenhuma próxima etapa foi definida.
-
-No deploy manual, publique `worker.mjs` com as duas rotas novas antes de disponibilizar `taxa-entrega.html`, `css/taxa-entrega.css`, `js/taxa-entrega.js` e o `js/pagamento-tmt.js` atualizado. O Worker antigo não atende `/api/entrega/*`. Nenhum deploy é feito por este projeto automaticamente.
-
-A integração servidor da TMT preserva os contratos e payloads da primeira cobrança, os preços, o polling e os caminhos existentes de Pixel/CAPI e webhook. Não existe endpoint que exporte o contexto do cliente. Pedidos anteriores cujos dados não foram retidos no servidor nem no navegador não podem ser reconstruídos pela consulta de status.
+`generate-catalog.cjs` atualiza os preços do bloco gerado em `worker.mjs` a partir de `js/produto-data.js`. Rode `node worker-pix/generate-catalog.cjs` quando alterar preços ou produtos.

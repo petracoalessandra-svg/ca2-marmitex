@@ -28,40 +28,14 @@ export const PRICES = Object.freeze({
 });
 // END GENERATED PRICES
 
-const SIGILO_API = 'https://app.sigilopay.com.br/api/v1/gateway';
-const VENO_API = 'https://venopagments.com';
-const venoHeaders = env => ({'X-Client-Id':env.VENO_CLIENT_ID,'X-Client-Secret':env.VENO_CLIENT_SECRET});
-const venoStatus = status => ({pending:'PENDING',confirmed:'PAID',expired:'CANCELLED',canceled:'CANCELLED',contested:'REFUNDED',chargedback:'REFUNDED',refunded:'REFUNDED'})[status] || 'PENDING';
-async function venoQuery(env, number) {
-  const url=new URL(VENO_API+'/api/consult-transaction'); url.searchParams.set('request_number',number);
-  const response=await fetch(url,{headers:venoHeaders(env),signal:AbortSignal.timeout(10000)});
-  const body=await response.json(); if(body.ok!==true) throw Error('VenoPag consultation failed'); return body;
-}
-const sigiloHeaders = env => ({'x-public-key':env.SIGILO_PUBLIC_KEY,'x-secret-key':env.SIGILO_SECRET_KEY});
-function sigiloStatus(value) { return ({PENDING:'PENDING',COMPLETED:'PAID',FAILED:'CANCELLED',EXPIRED:'CANCELLED',REFUNDED:'REFUNDED',CHARGED_BACK:'REFUNDED'})[value] || null; }
-async function sigiloQuery(env,identifier) {
-  const url=new URL(SIGILO_API+'/transactions');url.searchParams.set('clientIdentifier',identifier);
-  const response=await fetch(url,{headers:sigiloHeaders(env),signal:AbortSignal.timeout(8000)});
-  if (response.status===404) throw Error('Sigilo not found');
-  if (!response.ok) throw Error('Sigilo status unavailable');
-  const body=await response.json();
-  const data=Array.isArray(body) ? body.find(item=>item.clientIdentifier===identifier) : Array.isArray(body?.data) ? body.data.find(item=>item.clientIdentifier===identifier) : body?.data || body;
-  if (!data || data.clientIdentifier!==identifier || data.paymentMethod!=='PIX') throw Error('Sigilo status mismatch');
-  return data;
-}
+const MASTERFY_API = 'https://api.masterfypagamentos.com/v1/payment';
+const masterfyHeaders = env => ({'Content-Type':'application/json','Authorization':'Bearer '+env.MASTERFY_API_KEY});
+const masterfyStatus = value => ({PENDING:'PENDING',PROCESSING:'PENDING',PAID:'PAID',REFUSED:'CANCELLED',REFUNDED:'REFUNDED',MED:'REFUNDED',CHARGEDBACK:'REFUNDED'}[value] || null);
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const json = (data, status = 200, headers = {}) => new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'Referrer-Policy':'no-referrer', ...headers } });
 const SESSION_TTL = 86400000;
 const TOKEN = /^([0-9a-f-]{36})\.([0-9a-f]{64})$/;
 const hashToken = async token => Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(token))), x => x.toString(16).padStart(2,'0')).join('');
-
-function unavailablePix(saved) {
-  // A reservation is persisted before calling the provider. Only its absence allows
-  // the browser to submit the same request ID again; a generic 404 never does.
-  if (!saved) return json({code:'PIX_NOT_STARTED',error:'Esta tentativa ainda não foi enviada para pagamento.'},404);
-  if (saved.state === 'processing') return json({code:'PIX_PROCESSING',error:'A geração do PIX ainda está em processamento. Aguarde e tente recuperar novamente.'},409);
-  return json({code:'PIX_UNCERTAIN',error:'O resultado da geração do PIX precisa ser conferido no gateway.',diagnostic:saved.diagnostic || null},409);
-}
 
 async function paymentSession(request, env, path, cors) {
   if (!env.PAYMENT_SESSIONS || !env.PIX_STATUS_RATE_LIMITER || !env.PIX_REQUESTS) return json({error:'Sessões indisponíveis.'},503,cors);
@@ -100,7 +74,7 @@ function saleFromInput(input) {
     itemNotes.push(typeof item.observation === 'string' ? item.observation.trim() : '');
     const unitPrice = PRICES[item.name];
     amount += unitPrice * item.quantity;
-    return { title: item.name, quantity: item.quantity, unitPrice, tangible: true };
+    return { name: item.name, quantity: item.quantity, price: unitPrice, type: 'PHYSICAL' };
   });
   if (!Number.isSafeInteger(amount) || amount <= 0) throw Error('Valor do pedido inválido.');
   const c = input.customer || {}, a = input.address || {};
@@ -112,7 +86,7 @@ function saleFromInput(input) {
   if (!street || !number || !neighborhood || !city || !/^[A-Z]{2}$/.test(state) || !/^\d{8}$/.test(zipCode)) throw Error('Confira os campos de endereço, incluindo o bairro.');
   const metadata = JSON.stringify({ itemObservations: itemNotes, notes: c.notes ? c.notes.trim() : '', cpfOnReceipt: c.cpfOnReceipt === true });
   if (new TextEncoder().encode(metadata).length > 12000) throw Error('Observações muito longas.');
-  return { amount, currency: 'BRL', paymentMethod: 'pix', items, customer: { name, email, phone, document: { number: cpf, type: 'cpf' } }, shipping: { name, street, number, complement, neighborhood, city, state, zipCode }, metadata, externalRef: input.requestId };
+  return { amount, currency: 'BRL', method: 'PIX', items, payer: { name, email, phone: '+55' + phone, taxId: cpf }, delivery: { fee: 0, address: { country: 'BR', state, city, district: neighborhood, street, number, complement, zipCode } }, metadata, externalRef: input.requestId };
 }
 function allowedOrigin(request, env) {
   const origin = request.headers.get('Origin');
@@ -170,7 +144,7 @@ async function petRegistration(request, env, cors) {
   } catch (_) { return json({error:'Não foi possível salvar os dados.'},503,cors); }
 }
 
-const META_PIXEL_ID = '1179633571678200';
+const META_PIXEL_ID = '4491668551074059';
 const META_EVENTS = new Set(['PageView', 'ViewContent', 'AddToCart', 'InitiateCheckout', 'Lead', 'AddPaymentInfo', 'Purchase']);
 async function metaUserData(request, body) {
   const input = body.user_data && typeof body.user_data === 'object' ? body.user_data : {};
@@ -238,6 +212,22 @@ async function metaEvent(request, env, body, origin, cors) {
   } catch (_) { return json({error:'Evento indisponível.'},502,cors); }
 }
 
+async function venoWebhook(request, env) {
+  if (request.method !== 'POST') return json({error:'Método não permitido.'},405);
+  if (!env.VENOPAG_WEBHOOK_SECRET || !env.VENOPAG_CLIENT_ID || !env.PIX_REQUESTS) return json({error:'Serviço indisponível.'},503);
+  const parts=Object.fromEntries((request.headers.get('X-Veno-Signature') || '').split(',').map(x=>x.trim().split('=')));
+  const time=Number(parts.t), eventId=request.headers.get('X-Veno-Event-Id');
+  if (request.headers.get('X-Veno-Client-Id') !== env.VENOPAG_CLIENT_ID || !eventId || eventId.length>200 || !/^\d+$/.test(parts.t || '') || !Number.isSafeInteger(time) || Math.abs(Date.now()/1000-time)>300 || !/^[a-f0-9]{64}$/i.test(parts.v1 || '')) return json({error:'Assinatura inválida.'},401);
+  const raw=await request.text();
+  if (new TextEncoder().encode(raw).length>16384) return json({error:'Solicitação muito grande.'},413);
+  const key=await crypto.subtle.importKey('raw',new TextEncoder().encode(env.VENOPAG_WEBHOOK_SECRET),{name:'HMAC',hash:'SHA-256'},false,['verify']);
+  if (!await crypto.subtle.verify('HMAC',key,Uint8Array.from(parts.v1.match(/../g),x=>parseInt(x,16)),new TextEncoder().encode(parts.t+'.'+raw))) return json({error:'Assinatura inválida.'},401);
+  let body; try {body=JSON.parse(raw);} catch (_) {return json({error:'JSON inválido.'},400);}
+  const id=new URL(request.url).searchParams.get('requestId');
+  if (!UUID.test(id || '') || body.type!=='cashin' || typeof body.request_number!=='string' || !body.request_number) return json({error:'Evento inválido.'},400);
+  try {const object=env.PIX_REQUESTS.get(env.PIX_REQUESTS.idFromName(id.toLowerCase()));return await object.fetch('https://worker.internal/veno-webhook',{method:'POST',body:JSON.stringify({requestId:id.toLowerCase(),requestNumber:body.request_number,eventId})});} catch (_) {return json({error:'Serviço indisponível.'},503);}
+}
+
 async function blackcatWebhook(request, env) {
   if (request.method !== 'POST') return json({error:'Método não permitido.'},405);
   if (!/^application\/json(?:\s*;|$)/i.test(request.headers.get('Content-Type') || '')) return json({error:'Formato inválido.'},415);
@@ -251,40 +241,35 @@ async function blackcatWebhook(request, env) {
     return await object.fetch('https://worker.internal/webhook',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({transactionId:body.transactionId,requestId:body.externalReference.toLowerCase()})});
   } catch (_) { return json({error:'Serviço indisponível.'},503); }
 }
-async function sigiloWebhook(request,env) {
-  if(request.method!=='POST' || !env.SIGILO_SECRET_KEY || !env.PIX_REQUESTS) return json({error:'Indisponível'},503);
-  let body;
-  try {const raw=await request.text();if(new TextEncoder().encode(raw).length>16384)return json({error:'Muito grande'},413);body=JSON.parse(raw);} catch (_) {return json({error:'Inválido'},400);}
-  const transaction=body?.transaction;
-  if(body?.event!=='TRANSACTION_PAID' || !UUID.test(transaction?.identifier||'') || transaction?.status!=='COMPLETED' || transaction?.paymentMethod!=='PIX' || typeof body.token!=='string') return json({error:'Inválido'},400);
-  try {
-    const object=env.PIX_REQUESTS.get(env.PIX_REQUESTS.idFromName(transaction.identifier.toLowerCase()));
-    return object.fetch('https://worker.internal/sigilo-paid',{method:'POST',body:JSON.stringify({requestId:transaction.identifier,transactionId:transaction.id,token:body.token})});
-  } catch (_) {return json({error:'Indisponível'},503);}
-}
 
-async function venoWebhook(request,env) {
-  if(request.method!=='POST') return json({error:'Método inválido.'},405);
-  if(!env.VENO_WEBHOOK_SECRET || !env.VENO_CLIENT_ID || !env.PIX_REQUESTS) return json({error:'Indisponível.'},503);
-  const id=new URL(request.url).searchParams.get('id');
-  const signature=request.headers.get('X-Veno-Signature') || '';
-  const match=/^t=(\d+),v1=([0-9a-f]{64})$/i.exec(signature);
-  if(!UUID.test(id||'') || !match || Math.abs(Date.now()/1000-Number(match[1]))>300 || request.headers.get('X-Veno-Client-Id')!==env.VENO_CLIENT_ID || !request.headers.get('X-Veno-Event-Id')) return json({error:'Assinatura inválida.'},401);
-  if(Number(request.headers.get('Content-Length'))>16384) return json({error:'Muito grande.'},413);
-  const raw=await request.text(); if(new TextEncoder().encode(raw).length>16384) return json({error:'Muito grande.'},413);
-  const key=await crypto.subtle.importKey('raw',new TextEncoder().encode(env.VENO_WEBHOOK_SECRET),{name:'HMAC',hash:'SHA-256'},false,['verify']);
-  const bytes=Uint8Array.from(match[2].match(/../g),x=>parseInt(x,16));
-  if(!await crypto.subtle.verify('HMAC',key,bytes,new TextEncoder().encode(match[1]+'.'+raw))) return json({error:'Assinatura inválida.'},401);
-  let body; try {body=JSON.parse(raw);} catch (_) {return json({error:'JSON inválido.'},400);}
-  if(body?.type!=='cashin' || typeof body.request_number!=='string' || typeof body.transaction_id!=='string') return json({error:'Evento inválido.'},400);
-  try {const object=env.PIX_REQUESTS.get(env.PIX_REQUESTS.idFromName(id.toLowerCase()));return await object.fetch('https://worker.internal/veno-webhook',{method:'POST',body:JSON.stringify({requestId:id.toLowerCase(),requestNumber:body.request_number,transactionId:body.transaction_id})});} catch (_) {return json({error:'Indisponível.'},503);}
+async function masterfyWebhook(request, env) {
+  if (request.method !== 'POST') return json({error:'Método não permitido.'},405);
+  if (!/^application\/json(?:\s*;|$)/i.test(request.headers.get('Content-Type') || '')) return json({error:'Formato inválido.'},415);
+  if (!env.MASTERFY_WEBHOOK_SECRET || !env.PIX_REQUESTS) return json({error:'Serviço indisponível.'},503);
+  const raw=await request.text();
+  if (new TextEncoder().encode(raw).length>16384) return json({error:'Solicitação muito grande.'},413);
+  const signature=request.headers.get('X-Signature') || '';
+  let supplied;
+  try { supplied=Uint8Array.from(atob(signature),c=>c.charCodeAt(0)); } catch (_) { return json({error:'Assinatura inválida.'},401); }
+  if (!signature || supplied.length!==32) return json({error:'Assinatura inválida.'},401);
+  const key=await crypto.subtle.importKey('raw',new TextEncoder().encode(env.MASTERFY_WEBHOOK_SECRET),{name:'HMAC',hash:'SHA-256'},false,['verify']);
+  if (!await crypto.subtle.verify('HMAC',key,supplied,new TextEncoder().encode(raw))) return json({error:'Assinatura inválida.'},401);
+  let body; try { body=JSON.parse(raw); } catch (_) { return json({error:'JSON inválido.'},400); }
+  const event=request.headers.get('X-Webhook-Event') || '';
+  const status=masterfyStatus(body && body.status);
+  if (!body || !['payment.created','payment.paid','payment.refused','payment.refunded'].includes(event) || !status || !UUID.test(body.externalRef || '') || typeof body.id!=='string' || !body.id || body.id.length>200 || body.currency!=='BRL' || body.method!=='PIX' || !Number.isSafeInteger(body.amount) || body.amount<=0) return json({error:'Evento inválido.'},400);
+  if ((event==='payment.created' && !['PENDING','PROCESSING'].includes(body.status)) || (event==='payment.paid' && body.status!=='PAID') || (event==='payment.refused' && body.status!=='REFUSED') || (event==='payment.refunded' && !['REFUNDED','MED','CHARGEDBACK'].includes(body.status))) return json({error:'Evento inconsistente.'},400);
+  try {
+    const object=env.PIX_REQUESTS.get(env.PIX_REQUESTS.idFromName(body.externalRef.toLowerCase()));
+    return await object.fetch('https://worker.internal/masterfy-webhook',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({paymentId:body.id,requestId:body.externalRef.toLowerCase(),amount:body.amount,status,event})});
+  } catch (_) { return json({error:'Serviço indisponível.'},503); }
 }
 
 export default {
   async fetch(request, env) {
     if (new URL(request.url).pathname === '/api/venopag/webhook') return venoWebhook(request, env);
     if (new URL(request.url).pathname === '/api/blackcat/webhook') return blackcatWebhook(request, env);
-    if (new URL(request.url).pathname === '/api/sigilo/webhook') return sigiloWebhook(request, env);
+    if (new URL(request.url).pathname === '/api/masterfy/webhook') return masterfyWebhook(request, env);
     const origin = allowedOrigin(request, env);
     if (!origin) return json({ error: 'Origem não autorizada.' }, 403);
     const cors = { 'Access-Control-Allow-Origin': origin, 'Vary': 'Origin', 'Access-Control-Allow-Methods': 'POST, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type' };
@@ -301,7 +286,10 @@ export default {
       catch (_) { return json({error:'Evento inválido.'},400,cors); }
     }
     const limiter = path === '/api/pix/status' ? (env.PIX_STATUS_RATE_LIMITER || env.PIX_RATE_LIMITER) : env.PIX_RATE_LIMITER;
-    if (!limiter || !request.headers.get('CF-Connecting-IP')) return json({ error: 'Pagamento ainda não configurado.' }, 503, cors);
+    if (!limiter || !request.headers.get('CF-Connecting-IP')) {
+      console.log(JSON.stringify({event:'pix_config_missing',binding:!limiter?'rate_limiter':'client_ip'}));
+      return json({ error: 'Pagamento ainda não configurado.', code:'PIX_CONFIG_MISSING' }, 503, cors);
+    }
     const rate = await limiter.limit({ key: request.headers.get('CF-Connecting-IP') });
     if (!rate.success) return json({ error: 'Muitas solicitações. Tente novamente mais tarde.' }, 429, cors);
     let body, sale;
@@ -309,10 +297,14 @@ export default {
       const raw = await request.text();
       if (new TextEncoder().encode(raw).length > 16384) return json({ error: 'Solicitação muito grande.' }, 413, cors);
       body = JSON.parse(raw);
-      if (path === '/api/pix') sale = saleFromInput(body);
+      if (path === '/api/pix') { sale = saleFromInput(body); sale.ip=text(request.headers.get('CF-Connecting-IP') || '',45); }
       else if (!body || !UUID.test(body.requestId || '')) throw Error('Solicitação inválida.');
     } catch (error) { return json({ error: error instanceof SyntaxError ? 'JSON inválido.' : error.message }, 400, cors); }
-    if (!env.PIX_REQUESTS || (path === '/api/pix' && (!env.VENO_CLIENT_ID || !env.VENO_CLIENT_SECRET || !env.VENO_WEBHOOK_SECRET || !env.PUBLIC_WORKER_URL))) return json({ error: 'Pagamento ainda não configurado.' }, 503, cors);
+    const missing = !env.PIX_REQUESTS ? 'PIX_REQUESTS' : path === '/api/pix' && !env.MASTERFY_API_KEY ? 'MASTERFY_API_KEY' : path === '/api/pix' && !env.MASTERFY_WEBHOOK_SECRET ? 'MASTERFY_WEBHOOK_SECRET' : '';
+    if (missing) {
+      console.log(JSON.stringify({event:'pix_config_missing',binding:missing}));
+      return json({ error: 'Pagamento ainda não configurado.', code:'PIX_CONFIG_MISSING' }, 503, cors);
+    }
     const object = env.PIX_REQUESTS.get(env.PIX_REQUESTS.idFromName(body.requestId.toLowerCase()));
     try {
       const route = path === '/api/pix' ? 'create' : path === '/api/pix/status' ? 'status' : 'recover';
@@ -366,20 +358,6 @@ export class PixRequest {
   async fetch(request) {
     if (request.method !== 'POST') return json({ error: 'Não encontrado.' }, 404);
     if (new URL(request.url).pathname === '/issue') return this.issue(await request.json());
-    if (new URL(request.url).pathname === '/veno-webhook') {
-      const input=await request.json(), saved=await this.state.storage.get('sale');
-      if(!saved || saved.state!=='complete') return json({error:'Cobrança ainda indisponível.'},503);
-      if(saved.gateway!=='veno' || saved.requestId!==input.requestId || saved.venoRequestNumber!==input.requestNumber || saved.response.transactionId!==input.transactionId) return json({error:'Transação desconhecida.'},404);
-      const result=await this.venoRefresh(saved); if(!result.ok) return result;
-      const data=await result.json(); return data.status==='PAID' ? this.webhook(input) : json({ok:true});
-    }
-    if (new URL(request.url).pathname === '/sigilo-paid') {
-      const input=await request.json(), saved=await this.state.storage.get('sale');
-      if(!saved || saved.gateway!=='sigilo' ||
-        (!saved.recoveredWithoutWebhookToken && (!saved.webhookToken || saved.webhookToken!==input.token)) ||
-        saved.response.transactionId!==input.transactionId || saved.requestId!==input.requestId) return json({error:'Inválido'},403);
-      return this.webhook({requestId:input.requestId,transactionId:input.transactionId});
-    }
     if (new URL(request.url).pathname === '/session') return this.session(await request.json());
     if (new URL(request.url).pathname === '/fee') return this.fee(await request.json());
     if (new URL(request.url).pathname === '/status') return this.status();
@@ -387,28 +365,12 @@ export class PixRequest {
       const saved = await this.state.storage.get('sale');
       return saved?.state === 'complete' && saved.meta ? json({user_data:saved.meta.user_data}) : json({error:'Dados indisponíveis.'},404);
     }
+    if (new URL(request.url).pathname === '/masterfy-webhook') return this.masterfyWebhook(await request.json());
+    if (new URL(request.url).pathname === '/veno-webhook') return this.venoWebhook(await request.json());
     if (new URL(request.url).pathname === '/webhook') return this.webhook(await request.json());
     if (new URL(request.url).pathname === '/recover') {
       const saved = await this.state.storage.get('sale');
-      if (saved?.state === 'uncertain' && saved.sigiloRecovery) {
-        try {
-          const found = await sigiloQuery(this.env, saved.sigiloRecovery.requestId);
-          const code = found.pixInformation?.qrCode;
-          if (found.currency === 'BRL' && Math.round(found.amount * 100) === saved.sigiloRecovery.amount &&
-              ['PENDING', 'COMPLETED'].includes(found.status) && typeof found.id === 'string' && found.id &&
-              typeof code === 'string' && code.trim() && code.length <= 4096) {
-            const response = {transactionId:found.id,status:sigiloStatus(found.status),amount:saved.sigiloRecovery.amount,
-              paymentData:{copyPaste:code.trim(),qrCodeBase64:null,expiresAt:null}};
-            const {sigiloRecovery, ...original}=saved;
-            await this.state.storage.put('sale', {...original,state:'complete',gateway:'sigilo',response,
-              createdAt:Date.now(),requestId:saved.sigiloRecovery.requestId,meta:saved.sigiloRecovery.meta,
-              purpose:saved.sigiloRecovery.purpose,parentRequestId:saved.sigiloRecovery.parentRequestId,
-              recoveredWithoutWebhookToken:true});
-            return json(response);
-          }
-        } catch (_) { /* A consulta não autoriza criar uma segunda cobrança. */ }
-      }
-      if (!saved || saved.state !== 'complete') return unavailablePix(saved);
+      if (!saved || saved.state !== 'complete') return json({ error: 'Cobrança não disponível para recuperação.' }, 404);
       if (saved.createdAt && Date.now() >= saved.createdAt + SESSION_TTL) return json({error:'Link expirado.'},410);
       return json(saved.response);
     }
@@ -427,60 +389,34 @@ export class PixRequest {
     if (result) {
       if (result.fingerprint !== fingerprint) return json({ error: 'Este identificador já foi usado para outro pedido.' }, 409);
       if (result.state === 'complete') return result.createdAt && Date.now() >= result.createdAt + SESSION_TTL ? json({error:'Link expirado.'},410) : json(result.response);
-      return unavailablePix(result);
+      return json({ error: 'A solicitação já foi iniciada. Não crie outra cobrança; entre em contato com a loja.' }, 409);
     }
-    const diagnostic={stage:'provider_request',httpStatus:null,providerStatus:null,gateway:'venopag'};
     try {
-      return await this.createVeno(sale,envelope,fingerprint,diagnostic);
+      const metadata={provider:'deliveryv4.1',orderId:sale.externalRef,extra:JSON.parse(sale.metadata)};
+      const description=envelope.purpose==='tmt' || envelope.purpose==='delivery' ? sale.items[0].name : 'Pedido da loja '+sale.externalRef;
+      const requestBody={amount:sale.amount,currency:'BRL',method:'PIX',description,ip:sale.ip || undefined,payer:sale.payer,items:sale.items,delivery:sale.delivery,externalRef:sale.externalRef,metadata};
+      const response=await fetch(MASTERFY_API,{method:'POST',headers:masterfyHeaders(this.env),body:JSON.stringify(requestBody),signal:AbortSignal.timeout(20000)});
+      let data; try { data=await response.json(); } catch (_) { throw Error('invalid response'); }
+      if (!response.ok) {
+        if (response.status>=400 && response.status<500 && ![408,409,429].includes(response.status)) {await this.state.storage.delete('sale');return json({error:typeof data.message==='string'?data.message.slice(0,300):'Cobrança recusada.'},400);}
+        throw Error('uncertain gateway error');
+      }
+      const copyPaste=data && data.data && data.data.copypaste;
+      if (typeof data.id!=='string' || !data.id || data.id.length>200 || data.method!=='PIX' || data.currency!=='BRL' || data.amount!==sale.amount || !['PENDING','PROCESSING','PAID'].includes(data.status) || typeof copyPaste!=='string' || !copyPaste.trim() || copyPaste.length>4096) throw Error('invalid response');
+      const safe={transactionId:data.id,status:masterfyStatus(data.status) || 'PENDING',amount:sale.amount,paymentData:{copyPaste,qrCodeBase64:null,expiresAt:null}};
+      const createdAt=Date.now();
+      let tmtCustomer;
+      if (envelope.purpose !== 'tmt') {
+        try { tmtCustomer=await this.sealCustomer({name:sale.payer.name,email:sale.payer.email,phone:sale.payer.phone.replace(/^\+55/,''),cpf:sale.payer.taxId},sale.externalRef,createdAt+SESSION_TTL); }
+        catch (_) { console.log(JSON.stringify({event:'tmt_customer_capture_failed'})); }
+      }
+      await this.state.storage.put('sale', { fingerprint, state: 'complete', response: safe, provider:'masterfy', createdAt, requestId:sale.externalRef, meta: envelope.meta || null, purpose:envelope.purpose || 'order', parentRequestId:envelope.parentRequestId || null, ...(tmtCustomer ? {tmtCustomer} : {}) });
+      if (tmtCustomer) await this.scheduleCustomerCleanup(tmtCustomer.expiresAt);
+      return json(safe, 201);
     } catch (_) {
-      console.log(JSON.stringify({event:'pix_creation_failed',...diagnostic}));
-      const stored=await this.state.storage.get('sale');
-      if (stored?.state==='complete') return json(stored.response);
-      await this.state.storage.transaction(async tx=>{
-        const current=await tx.get('sale');
-        if (current?.state !== 'complete') await tx.put('sale', {fingerprint,state:'uncertain',diagnostic,
-          });
-      });
-      return json({code:'PIX_UNCERTAIN',diagnostic,error:'Não foi possível confirmar a geração do PIX. Não repita a cobrança; entre em contato com a loja.'},502);
+      await this.state.storage.put('sale', { fingerprint, state: 'uncertain' });
+      return json({ error: 'Não foi possível confirmar a geração do PIX. Não repita a cobrança; entre em contato com a loja.' }, 502);
     }
-  }
-  async createVeno(sale,envelope,fingerprint,diagnostic) {
-    if(!this.env.VENO_CLIENT_ID || !this.env.VENO_CLIENT_SECRET || !this.env.VENO_WEBHOOK_SECRET || !this.env.PUBLIC_WORKER_URL) throw Error('VenoPag not configured');
-    const callback=new URL('/api/venopag/webhook',this.env.PUBLIC_WORKER_URL); callback.searchParams.set('id',sale.externalRef);
-    const payload={amount:sale.amount/100,name:sale.customer.name,document:sale.customer.document.number,description:'Pedido '+sale.externalRef,webhook_url:callback.toString()};
-    const response=await fetch(VENO_API+'/api/cashin',{method:'POST',headers:{...venoHeaders(this.env),'Content-Type':'application/json'},body:JSON.stringify(payload),signal:AbortSignal.timeout(20000)});
-    diagnostic.httpStatus=response.status; const body=await response.json(); diagnostic.providerStatus=body.ok===true?'ok':'error';
-    if(body.ok!==true || body.status!=='pending' || Math.round(body.amount*100)!==sale.amount || typeof body.request_number!=='string' || !body.request_number || typeof body.transaction_id!=='string' || !body.transaction_id || typeof body.copyPaste!=='string' || !body.copyPaste.trim() || !Number.isFinite(body.expire_minutes) || body.expire_minutes<=0) throw Error('Invalid VenoPag response');
-    const createdAt=Date.now(), safe={transactionId:body.transaction_id,status:'PENDING',amount:sale.amount,paymentData:{copyPaste:body.copyPaste,qrCodeBase64:body.qr_img?'data:image/png;base64,'+body.qr_img:null,expiresAt:new Date(createdAt+body.expire_minutes*60000).toISOString()}};
-    let tmtCustomer; if(envelope.purpose!=='tmt') {try {tmtCustomer=await this.sealCustomer({name:sale.customer.name,email:sale.customer.email,phone:sale.customer.phone,cpf:sale.customer.document.number},sale.externalRef,createdAt+SESSION_TTL);} catch (_) {}}
-    await this.state.storage.put('sale',{fingerprint,state:'complete',gateway:'veno',venoRequestNumber:body.request_number,response:safe,createdAt,requestId:sale.externalRef,meta:envelope.meta||null,purpose:envelope.purpose||'order',parentRequestId:envelope.parentRequestId||null,...(tmtCustomer?{tmtCustomer}:{})});
-    if(tmtCustomer) await this.scheduleCustomerCleanup(tmtCustomer.expiresAt); return json(safe,201);
-  }
-  async venoRefresh(saved) {
-    try {
-      const data=await venoQuery(this.env,saved.venoRequestNumber);
-      if(data.request_number!==saved.venoRequestNumber || data.transaction_id!==saved.response.transactionId || Math.round(data.amount*100)!==saved.response.amount || (data.currency && data.currency!=='BRL')) throw Error('VenoPag mismatch');
-      const status=venoStatus(data.status);
-      const current=await this.state.storage.transaction(async tx=>{const record=await tx.get('sale');record.response.status=status;record.venoStatus=data.status;record.statusCheckedAt=Date.now();if(status==='PAID')record.paidAt ||= Date.now();await tx.put('sale',record);return record;});
-      try {await this.mirror(current);} catch (_) {} return json({status:current.response.status,amount:current.response.amount});
-    } catch (_) {return json({error:'Não foi possível consultar o pagamento.'},503);}
-  }
-  async createSigilo(sale,envelope,fingerprint,diagnostic) {
-    if (!this.env.SIGILO_PUBLIC_KEY || !this.env.SIGILO_SECRET_KEY || !this.env.PUBLIC_WORKER_URL) throw Error('Sigilo not configured');
-    const payload={identifier:sale.externalRef,amount:sale.amount/100,client:{name:sale.customer.name,email:sale.customer.email,phone:sale.customer.phone,document:sale.customer.document.number},products:sale.items.map((item,index)=>({id:String(index+1),name:item.title,quantity:item.quantity,price:item.unitPrice/100,physical:item.tangible})),callbackUrl:this.env.PUBLIC_WORKER_URL+'/api/sigilo/webhook'};
-    const response=await fetch(SIGILO_API+'/pix/receive',{method:'POST',headers:{...sigiloHeaders(this.env),'Content-Type':'application/json'},body:JSON.stringify(payload),signal:AbortSignal.timeout(20000)});
-    diagnostic.httpStatus=response.status;diagnostic.stage='provider_json';
-    const body=await response.json();diagnostic.stage='provider_response';
-    if (!response.ok || !['OK','PENDING'].includes(body.status) || typeof body.transactionId!=='string' || !body.transactionId || typeof body.pix?.code!=='string' || !body.pix.code.trim()) {
-      throw Error('Sigilo response invalid');
-    }
-    const createdAt=Date.now();
-    const safe={transactionId:body.transactionId,status:'PENDING',amount:sale.amount,paymentData:{copyPaste:body.pix.code,qrCodeBase64:null,expiresAt:body.pix.expiresAt||null}};
-    let tmtCustomer;
-    if (envelope.purpose!=='tmt') {try {tmtCustomer=await this.sealCustomer({name:sale.customer.name,email:sale.customer.email,phone:sale.customer.phone,cpf:sale.customer.document.number},sale.externalRef,createdAt+SESSION_TTL);} catch (_) {console.log(JSON.stringify({event:'tmt_customer_capture_failed'}));}}
-    await this.state.storage.put('sale',{fingerprint,state:'complete',gateway:'sigilo',webhookToken:body.webhookToken||null,response:safe,createdAt,requestId:sale.externalRef,meta:envelope.meta||null,purpose:envelope.purpose||'order',parentRequestId:envelope.parentRequestId||null,...(tmtCustomer?{tmtCustomer}:{})});
-    if(tmtCustomer)await this.scheduleCustomerCleanup(tmtCustomer.expiresAt);
-    return json(safe,201);
   }
   async fee({token,kind='tmt',customer,action,source}) {
     if (!['tmt','delivery'].includes(kind)) return json({error:'Cobrança inválida.'},400);
@@ -530,7 +466,7 @@ export class PixRequest {
     });
     const amount=kind==='tmt'?990:790;
     const title=kind==='tmt'?'Taxa de Manipulação e Transporte':'Taxa de Entrega';
-    const sale={amount,currency:'BRL',paymentMethod:'pix',items:[{title,quantity:1,unitPrice:amount,tangible:false}],customer:{name,email,phone,document:{number:cpf,type:'cpf'}},metadata:JSON.stringify({purpose:kind,parentRequestId:saved.requestId,parentTransactionId:saved.response.transactionId}),externalRef:feeId};
+    const sale={amount,currency:'BRL',method:'PIX',items:[{name:title,quantity:1,price:amount,type:'DIGITAL'}],payer:{name,email,phone:'+55'+phone,taxId:cpf},metadata:JSON.stringify({purpose:kind,parentRequestId:saved.requestId,parentTransactionId:saved.response.transactionId}),externalRef:feeId};
     const object=this.env.PIX_REQUESTS.get(this.env.PIX_REQUESTS.idFromName(feeId));
     const response=await object.fetch('https://worker.internal/create',{method:'POST',body:JSON.stringify({sale,purpose:kind,parentRequestId:saved.requestId,meta:saved.meta ? {...saved.meta,source} : null})});
     return response.ok ? json({...await response.json(),feeRequestId:feeId},response.status) : response;
@@ -598,25 +534,67 @@ export class PixRequest {
     }
     return json({orderReference:'EV-' + context.requestId.slice(0,8).toUpperCase(),status:payment.status,amount:payment.amount,expiresAt:context.expiresAt,pollAfterMs:6000,serverNow:Date.now(),tmtExpiresAt});
   }
+  async venoWebhook(input) {
+    const saved=await this.state.storage.get('sale');
+    if (!saved || saved.provider!=='venopag' || saved.response.requestNumber!==input.requestNumber) return json({error:'Transação desconhecida.'},404);
+    const result=await this.venoReconcile(saved);
+    if (!result.ok) return result;
+    const data=await result.json();
+    if (data.status!=='PAID') return json({ok:true});
+    const current=await this.state.storage.get('sale');
+    if (current.metaPurchaseSent) return json({ok:true});
+    const token=await metaToken(this.env);
+    if (!token || !current.meta || !hasMetaCustomerData(current.meta.user_data)) return json({ok:true});
+    const send=await this.state.storage.transaction(async tx=>{const r=await tx.get('sale');if(r.metaPurchaseSent || r.metaSendingUntil>Date.now())return false;r.metaSendingUntil=Date.now()+10000;await tx.put('sale',r);return true;});
+    if (!send) return json({error:'Rastreamento em processamento.'},503);
+    try {
+      const event={event_name:'Purchase',event_time:Math.floor(Date.now()/1000),event_id:input.requestId,action_source:'website',event_source_url:current.meta.source,user_data:current.meta.user_data,custom_data:{currency:'BRL',value:current.response.amount/100}};
+      const sent=await fetch('https://graph.facebook.com/v22.0/'+META_PIXEL_ID+'/events',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},body:JSON.stringify({data:[event]}),signal:AbortSignal.timeout(3500)});
+      if (!sent.ok) throw Error('Meta unavailable');
+      await this.state.storage.transaction(async tx=>{const r=await tx.get('sale');r.metaPurchaseSent=true;r.metaSendingUntil=0;await tx.put('sale',r);});return json({ok:true});
+    } catch (_) {await this.state.storage.transaction(async tx=>{const r=await tx.get('sale');r.metaSendingUntil=0;await tx.put('sale',r);});return json({error:'Envio à Meta indisponível.'},503);}
+  }
+  async masterfyWebhook(input) {
+    const saved=await this.state.storage.get('sale');
+    if (!saved || saved.state!=='complete' || saved.provider!=='masterfy' || saved.requestId!==input.requestId || saved.response.transactionId!==input.paymentId || saved.response.amount!==input.amount) return json({error:'Transação desconhecida.'},404);
+    if ((input.event==='payment.paid' && input.status!=='PAID') || (input.event==='payment.refused' && input.status!=='CANCELLED') || (input.event==='payment.refunded' && input.status!=='REFUNDED')) return json({error:'Evento inconsistente.'},400);
+    const current=await this.state.storage.transaction(async tx=>{
+      const row=await tx.get('sale');
+      if (row.response.status!=='REFUNDED' && !(row.response.status==='PAID' && ['PENDING','CANCELLED'].includes(input.status)) && !(row.response.status==='CANCELLED' && input.status==='PENDING')) row.response.status=input.status;
+      if (row.response.status==='PAID') row.paidAt ||= Date.now();
+      await tx.put('sale',row);return row;
+    });
+    try { await this.mirror(current); } catch (_) { return json({error:'Persistência indisponível.'},503); }
+    if (current.response.status!=='PAID') return json({ok:true});
+    const token=await metaToken(this.env);
+    if (!token || current.metaPurchaseSent || !current.meta || !hasMetaCustomerData(current.meta.user_data)) return json({ok:true});
+    const send=await this.state.storage.transaction(async tx=>{const row=await tx.get('sale');if(row.metaPurchaseSent || row.metaSendingUntil>Date.now())return false;row.metaSendingUntil=Date.now()+10000;await tx.put('sale',row);return true;});
+    if (!send) return json({ok:true});
+    try {
+      const event={event_name:'Purchase',event_time:Math.floor(Date.now()/1000),event_id:input.requestId,action_source:'website',event_source_url:current.meta.source,user_data:current.meta.user_data,custom_data:{currency:'BRL',value:current.response.amount/100}};
+      const sent=await fetch('https://graph.facebook.com/v22.0/'+META_PIXEL_ID+'/events',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},body:JSON.stringify({data:[event]}),signal:AbortSignal.timeout(3500)});
+      if (!sent.ok) throw Error('Meta unavailable');
+      await this.state.storage.transaction(async tx=>{const row=await tx.get('sale');row.metaPurchaseSent=true;row.metaSendingUntil=0;await tx.put('sale',row);});return json({ok:true});
+    } catch (_) { await this.state.storage.transaction(async tx=>{const row=await tx.get('sale');row.metaSendingUntil=0;await tx.put('sale',row);});return json({error:'Envio à Meta indisponível.'},503); }
+  }
+  async venoReconcile(saved) {
+    try {
+      const url=new URL('https://venopagments.com/api/consult-transaction');url.searchParams.set('request_number',saved.response.requestNumber);
+      const response=await fetch(url.href,{headers:venoHeaders(this.env),signal:AbortSignal.timeout(15000)});const data=await response.json();
+      if (!data.ok || data.request_number!==saved.response.requestNumber || data.transaction_id!==saved.response.transactionId || Math.round(data.amount*100)!==saved.response.amount || typeof data.status!=='string') throw Error('invalid response');
+      const current=await this.state.storage.transaction(async tx=>{const r=await tx.get('sale');r.response.status=venoStatus(data.status);r.venoStatus=data.status;r.statusCheckedAt=Date.now();if(r.response.status==='PAID')r.paidAt ||= Date.now();await tx.put('sale',r);return r;});
+      try {await this.mirror(current);} catch (_) {return json({error:'Persistência indisponível.'},503);}
+      return json({status:current.response.status,amount:current.response.amount});
+    } catch (_) {return json({error:'Não foi possível consultar o pagamento.'},503);}
+  }
   async webhook(input) {
     const saved=await this.state.storage.get('sale');
     if (!saved || saved.state !== 'complete' || saved.response.transactionId !== input.transactionId) return json({error:'Transação desconhecida.'},404);
     if (saved.metaPurchaseSent) { try { await this.mirror(saved); return json({ok:true}); } catch (_) { return json({error:'Persistência indisponível.'},503); } }
     try {
-      let data;
-      if (saved.gateway==='veno') {
-        const verified=await venoQuery(this.env,saved.venoRequestNumber);
-        if(verified.request_number!==saved.venoRequestNumber) return json({error:'Pagamento não verificado.'},503);
-        data={transactionId:verified.transaction_id,amount:Math.round(verified.amount*100),paymentMethod:'pix',status:venoStatus(verified.status)};
-      } else if (saved.gateway==='sigilo') {
-        const verified=await sigiloQuery(this.env,saved.requestId);
-        data={transactionId:verified.id,amount:Math.round(verified.amount*100),paymentMethod:verified.paymentMethod,status:sigiloStatus(verified.status)};
-      } else {
-        const check=await fetch('https://api.blackcatoficial.com/api/sales/' + encodeURIComponent(input.transactionId) + '/status',{headers:{'X-API-Key':this.env.BLACKCAT_API_KEY},signal:AbortSignal.timeout(3500)});
-        const body=await check.json();data=body && body.data;
-        if (!check.ok || !body.success) return json({error:'Pagamento não verificado.'},503);
-      }
-      if (!data || data.transactionId !== input.transactionId || data.amount !== saved.response.amount || String(data.paymentMethod).toLowerCase() !== 'pix') return json({error:'Pagamento não verificado.'},503);
+      const check=await fetch('https://api.blackcatoficial.com/api/sales/' + encodeURIComponent(input.transactionId) + '/status',{headers:{'X-API-Key':this.env.BLACKCAT_API_KEY},signal:AbortSignal.timeout(3500)});
+      const body=await check.json(), data=body && body.data;
+      if (!check.ok || !body.success || !data || data.transactionId !== input.transactionId || data.amount !== saved.response.amount || String(data.paymentMethod).toLowerCase() !== 'pix') return json({error:'Pagamento não verificado.'},503);
       if (data.status !== 'PAID') return json({error:'Pagamento ainda não confirmado.'},409);
       const confirmed = await this.state.storage.transaction(async tx => {
         const current = await tx.get('sale');
@@ -648,20 +626,11 @@ export class PixRequest {
   }
   async status() {
     const saved = await this.state.storage.get('sale');
-    if (!saved || saved.state !== 'complete') return unavailablePix(saved);
+    if (!saved || saved.state !== 'complete') return json({ error: 'Cobrança não disponível para consulta.' }, 404);
     if (saved.createdAt && Date.now() >= saved.createdAt + SESSION_TTL) return json({error:'Link expirado.'},410);
+    if (saved.provider==='masterfy') return json({status:saved.response.status,amount:saved.response.amount});
     if (saved.statusCheckedAt && Date.now() - saved.statusCheckedAt < 15000) return json({ status: saved.response.status, amount: saved.response.amount });
-    if (saved.gateway==='veno') return this.venoRefresh(saved);
-    if (saved.gateway==='sigilo') {
-      try {
-        const data=await sigiloQuery(this.env,saved.requestId);
-        if(data.id!==saved.response.transactionId || Math.round(data.amount*100)!==saved.response.amount) throw Error('Sigilo amount mismatch');
-        const status=sigiloStatus(data.status);if(!status)throw Error('Sigilo status invalid');
-        const current=await this.state.storage.transaction(async tx=>{const record=await tx.get('sale');if(record.response.status!=='PAID' || status==='REFUNDED')record.response.status=status;record.statusCheckedAt=Date.now();if(record.response.status==='PAID')record.paidAt ||= Date.now();await tx.put('sale',record);return record;});
-        try {await this.mirror(current);} catch (_) {}
-        return json({status:current.response.status,amount:current.response.amount});
-      } catch (_) {return json({error:'Não foi possível consultar o pagamento.'},503);}
-    }
+    if (saved.provider === 'venopag') return this.venoReconcile(saved);
     // Reservar o intervalo antes da chamada para limitar consultas simultâneas.
     const reserved = await this.state.storage.transaction(async tx => {
       const current = await tx.get('sale');

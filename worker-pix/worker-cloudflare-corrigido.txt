@@ -92,7 +92,7 @@ function allowedOrigin(request, env) {
   return origin && (allowed.includes('*') || allowed.includes(origin)) ? origin : '';
 }
 
-const META_PIXEL_ID = '1179633571678200';
+const META_PIXEL_ID = '4491668551074059';
 const META_EVENTS = new Set(['PageView', 'ViewContent', 'AddToCart', 'InitiateCheckout', 'Lead', 'AddPaymentInfo', 'Purchase']);
 async function metaUserData(request, body) {
   const input = body.user_data && typeof body.user_data === 'object' ? body.user_data : {};

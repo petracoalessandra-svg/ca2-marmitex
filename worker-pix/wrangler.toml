@@ -1,4 +1,4 @@
-name = "conta2dlv31"
+name = "marmita"
 main = "worker.mjs"
 compatibility_date = "2026-10-27"
 
@@ -12,7 +12,6 @@ command = "node generate-catalog.cjs"
 [vars]
 ALLOWED_ORIGINS = "*"
 SUPABASE_URL = "https://cvbpvsiiofwdpkohxqgq.supabase.co"
-PUBLIC_WORKER_URL = "https://conta2dlv31.ulissonsilvera88.workers.dev"
 
 [[kv_namespaces]]
 binding = "PAYMENT_SESSIONS"

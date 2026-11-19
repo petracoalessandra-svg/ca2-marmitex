@@ -37,7 +37,8 @@ test('customer step validates details, toggles CPF and returns to the preserved 
   app.el('checkout-cep').value='01001000'; app.el('checkout-cep').listeners.input({target:app.el('checkout-cep')}); await tick();
   app.el('checkout-number').value='123'; app.el('checkout-address-form').listeners.submit({preventDefault(){}});
   assert.equal(app.el('checkout-data-step').hidden,false); assert.equal(app.el('checkout-address-step').hidden,true);
-  app.el('checkout-data-form').listeners.submit({preventDefault(){}}); assert.match(app.el('checkout-data-status').textContent,/obrigatórios/);
+  app.el('checkout-data-form').listeners.submit({preventDefault(){}}); assert.match(app.el('checkout-data-status').textContent,/nome e sobrenome/);
+  for (const name of ['Maria', 'Maria   ', 'Maria 123']) { app.el('checkout-name').value=name; app.el('checkout-data-form').listeners.submit({preventDefault(){}}); assert.match(app.el('checkout-data-status').textContent,/nome e sobrenome/); assert.equal(app.el('checkout-name').focused,true); assert.equal(app.events.length,1); }
   app.el('checkout-name').value='Maria Silva'; app.el('checkout-phone').value='11987654321'; app.el('checkout-phone').listeners.input({target:app.el('checkout-phone')});
   assert.equal(app.el('checkout-phone').value,'(11) 98765-4321'); app.el('checkout-email').value='maria@example.com';
   app.el('checkout-cpf-yes').checked=true;
@@ -206,7 +207,9 @@ test('optional fields use configured fallback only when blank and still validate
  assert.equal(app.events.at(-1).detail.address.number,'42');
  app.el('checkout-phone').value='11987654321'; app.el('checkout-email').value='maria@example.com';
  app.el('checkout-data-form').listeners.submit({preventDefault(){}});
- assert.equal(app.events.at(-1).detail.customer.name,'Nome Reserva'); assert.equal(app.events.at(-1).detail.customer.cpf,'52998224725');
+ assert.match(app.el('checkout-data-status').textContent,/nome e sobrenome/);
+ app.el('checkout-name').value='Maria Silva'; app.el('checkout-data-form').listeners.submit({preventDefault(){}});
+ assert.equal(app.events.at(-1).detail.customer.name,'Maria Silva'); assert.equal(app.events.at(-1).detail.customer.cpf,'52998224725');
  app.el('checkout-name').value='Maria Silva'; app.el('checkout-cpf-yes').checked=true; app.el('checkout-cpf').value='123';
  const count=app.events.length; app.el('checkout-data-form').listeners.submit({preventDefault(){}}); assert.equal(app.events.length,count);
  app.el('checkout-cpf').value='52998224725'; app.el('checkout-data-form').listeners.submit({preventDefault(){}}); assert.equal(app.events.at(-1).detail.customer.name,'Maria Silva');

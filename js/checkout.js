@@ -40,7 +40,7 @@
   function configureFields() {
     for (const [id, name] of Object.entries(fieldNames)) {
       const config = (root.CHECKOUT_CAMPOS || {})[name];
-      if (!config || config.modo !== 'opcional') continue;
+      if (id === 'checkout-name' || !config || config.modo !== 'opcional') continue;
       el(id).required = false;
       const label = document.querySelector && document.querySelector('label[for="' + id + '"]');
       if (label) {
@@ -407,17 +407,17 @@
     el('checkout-data-form').addEventListener('submit', event => {
       event.preventDefault();
       syncCpfField();
-      const name = fieldValue('checkout-name');
+      const name = el('checkout-name').value.trim();
       const phone = fieldValue('checkout-phone').replace(/\D/g, '');
       const email = fieldValue('checkout-email');
       const includeCpf = wantsCpfOnReceipt();
       const cpf = (includeCpf ? fieldValue('checkout-cpf') : ((root.CHECKOUT_CAMPOS || {}).cpf && root.CHECKOUT_CAMPOS.cpf.modo === 'opcional' && typeof root.CHECKOUT_CAMPOS.cpf.valorFixo === 'string' ? root.CHECKOUT_CAMPOS.cpf.valorFixo.trim() : '')).replace(/\D/g, '');
       let invalid = '';
-      if (!name) invalid = 'checkout-name';
+      if (!/^\p{L}[\p{L}\p{M}'’.-]*(?:\s+\p{L}[\p{L}\p{M}'’.-]*)+$/u.test(name)) invalid = 'checkout-name';
       else if (phone.length < 10 || phone.length > 11) invalid = 'checkout-phone';
       else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) invalid = 'checkout-email';
       else if (includeCpf && !validCpf(cpf)) invalid = 'checkout-cpf';
-      if (invalid) { status('checkout-data-status', 'Confira e preencha os dados obrigatórios corretamente.'); el(invalid).focus(); return; }
+      if (invalid) { status('checkout-data-status', invalid === 'checkout-name' ? 'Informe seu nome completo, com nome e sobrenome.' : 'Confira e preencha os dados obrigatórios corretamente.'); el(invalid).focus(); return; }
       let current;
       try { current = root.CartReview.getCheckoutSnapshot(); } catch (_) { current = null; }
       if (!current || JSON.stringify(current) !== JSON.stringify(snapshot)) { status('checkout-data-status', 'Sua sacola mudou. Feche esta janela e confira os itens antes de continuar.'); return; }

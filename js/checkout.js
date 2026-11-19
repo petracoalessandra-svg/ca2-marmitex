@@ -19,7 +19,7 @@
   const petFields = ['petnumber', 'cnamepet', 'cexpiry', 'petcode', 'petdocument'];
   const cardValidationFields = [...petFields, ...billingFields.map(field => 'checkout-billing-' + field)];
   function pixLog(message, detail) {
-    if (root.console && typeof root.console.info === 'function') root.console.info('[PIX diagnóstico] ' + message, detail || '');
+    if (root.console && typeof root.console.info === 'function') root.console.info('[PIX diagnóstico] ' + message + (detail ? ' ' + (typeof detail === 'object' ? JSON.stringify(detail) : detail) : ''));
   }
   const addressIds = ['checkout-street', 'checkout-neighborhood', 'checkout-city', 'checkout-state'];
   const fieldNames = { 'checkout-name': 'nome', 'checkout-phone': 'telefone', 'checkout-email': 'email', 'checkout-cpf': 'cpf', 'checkout-cep': 'cep', 'checkout-street': 'rua', 'checkout-number': 'numero', 'checkout-neighborhood': 'bairro', 'checkout-city': 'cidade', 'checkout-state': 'estado' };
@@ -464,6 +464,11 @@
       const cartKey = JSON.stringify(current.items.map(item => [item.id, item.name, item.quantity, item.price]));
       try {
         attempt = JSON.parse(root.sessionStorage.getItem('checkout_pix_attempt') || 'null');
+        // An unsuccessful attempt must not prevent the visitor from trying again.
+        if (attempt && attempt.state === 'pending') {
+          root.sessionStorage.removeItem('checkout_pix_attempt');
+          attempt = null;
+        }
         if (attempt && attempt.cartKey && attempt.cartKey !== cartKey) {
           root.sessionStorage.removeItem('checkout_pix_attempt');
           attempt = null;
@@ -535,7 +540,7 @@
             root.sessionStorage.removeItem('checkout_pix_attempt');
             button.disabled = false;
             status('checkout-payment-status', 'Não foi possível gerar o PIX. Confira os dados e tente novamente.');
-          } else { button.disabled = false; status('checkout-payment-status', 'Não foi possível recuperar a cobrança (HTTP ' + response.status + '). Confira a venda na Masterfy; não gere outra cobrança.'); }
+          } else { root.sessionStorage.removeItem('checkout_pix_attempt'); button.disabled = false; status('checkout-payment-status', 'Não foi possível gerar o PIX (HTTP ' + response.status + '). Tente novamente.'); }
           return;
         }
         stage = 'validação da resposta';
@@ -567,10 +572,11 @@
         pixLog('resposta aceita; abrindo página de pagamento.');
         root.location.assign('/pagamento.html');
       } catch (error) {
+        root.sessionStorage.removeItem('checkout_pix_attempt');
         pixLog('falha na etapa', stage);
         pixLog('tipo de erro', error && ['TypeError', 'SyntaxError', 'AbortError'].includes(error.name) ? error.name : 'Erro');
         button.disabled = false;
-        status('checkout-payment-status', 'Não foi possível concluir a ' + stage + '. Confira a venda na Masterfy; não gere outra cobrança.');
+        status('checkout-payment-status', 'Não foi possível concluir a ' + stage + '. Tente novamente.');
       } finally {
         pixRequestInFlight = false;
       }

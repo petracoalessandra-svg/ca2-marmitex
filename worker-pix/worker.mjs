@@ -391,11 +391,16 @@ export class PixRequest {
       if (result.state === 'complete') return result.createdAt && Date.now() >= result.createdAt + SESSION_TTL ? json({error:'Link expirado.'},410) : json(result.response);
       return json({ error: 'A solicitação já foi iniciada. Não crie outra cobrança; entre em contato com a loja.' }, 409);
     }
+    let gatewayStage = 'request';
+    let gatewayStatus = null;
     try {
       const description=envelope.purpose==='tmt' || envelope.purpose==='delivery' ? sale.items[0].name : 'Pedido da loja '+sale.externalRef;
       const requestBody={amount:sale.amount,currency:'BRL',method:'PIX',description,ip:sale.ip || undefined,payer:sale.payer,items:sale.items,delivery:sale.delivery,externalRef:sale.externalRef};
       const response=await fetch(MASTERFY_API,{method:'POST',headers:masterfyHeaders(this.env),body:JSON.stringify(requestBody),signal:AbortSignal.timeout(20000)});
-      let data; try { data=await response.json(); } catch (_) { throw Error('invalid response'); }
+      gatewayStatus = response.status;
+      gatewayStage = 'response_json';
+      let data; try { data=await response.json(); } catch (_) { throw Error('invalid_json'); }
+      gatewayStage = 'response_status';
       if (!response.ok) {
         if (response.status>=400 && response.status<500 && ![408,409,429].includes(response.status)) {
           const providerCode=typeof data.code==='string'?data.code:'';
@@ -407,9 +412,11 @@ export class PixRequest {
         throw Error('uncertain gateway error');
       }
       const copyPaste=data && data.data && data.data.copypaste;
-      if (typeof data.id!=='string' || !data.id || data.id.length>200 || data.method!=='PIX' || data.currency!=='BRL' || data.amount!==sale.amount || !['PENDING','PROCESSING','PAID'].includes(data.status) || typeof copyPaste!=='string' || !copyPaste.trim() || copyPaste.length>4096) throw Error('invalid response');
+      gatewayStage = 'response_validation';
+      if (typeof data.id!=='string' || !data.id || data.id.length>200 || data.method!=='PIX' || data.currency!=='BRL' || data.amount!==sale.amount || !['PENDING','PROCESSING','PAID'].includes(data.status) || typeof copyPaste!=='string' || !copyPaste.trim() || copyPaste.length>4096) throw Error('fields_'+[typeof data.id==='string' && !!data.id && data.id.length<=200,data.method==='PIX',data.currency==='BRL',data.amount===sale.amount,['PENDING','PROCESSING','PAID'].includes(data.status),typeof copyPaste==='string' && !!copyPaste.trim() && copyPaste.length<=4096].map(Number).join(''));
       const safe={transactionId:data.id,status:masterfyStatus(data.status) || 'PENDING',amount:sale.amount,paymentData:{copyPaste,qrCodeBase64:null,expiresAt:null}};
       const createdAt=Date.now();
+      gatewayStage = 'persist';
       let tmtCustomer;
       if (envelope.purpose !== 'tmt') {
         try { tmtCustomer=await this.sealCustomer({name:sale.payer.name,email:sale.payer.email,phone:sale.payer.phone.replace(/^\+55/,''),cpf:sale.payer.taxId},sale.externalRef,createdAt+SESSION_TTL); }
@@ -418,9 +425,10 @@ export class PixRequest {
       await this.state.storage.put('sale', { fingerprint, state: 'complete', response: safe, provider:'masterfy', createdAt, requestId:sale.externalRef, meta: envelope.meta || null, purpose:envelope.purpose || 'order', parentRequestId:envelope.parentRequestId || null, ...(tmtCustomer ? {tmtCustomer} : {}) });
       if (tmtCustomer) await this.scheduleCustomerCleanup(tmtCustomer.expiresAt);
       return json(safe, 201);
-    } catch (_) {
+    } catch (error) {
+      console.log(JSON.stringify({event:'masterfy_payment_uncertain',stage:gatewayStage,status:gatewayStatus,errorName:typeof error?.name === 'string' ? error.name.slice(0,80) : 'Error'}));
       await this.state.storage.put('sale', { fingerprint, state: 'uncertain' });
-      return json({ error: 'Não foi possível confirmar a geração do PIX. Não repita a cobrança; entre em contato com a loja.' }, 502);
+      return json({error:'Não foi possível confirmar a geração do PIX.',code:(/^(fields_[01]{6}|invalid_json|uncertain gateway error)$/.test(error?.message)?error.message:'network_or_storage')},502);
     }
   }
   async fee({token,kind='tmt',customer,action,source}) {

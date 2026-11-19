@@ -112,13 +112,13 @@ test('a changed cart can start a new request after an unresolved attempt',async(
   app.cart.items[0].quantity=2; app.cart.items[0].total=45.98; app.cart.total=45.98; app.cart.subtotal=45.98;
   await readyForPix(app); await app.el('checkout-generate-pix').listeners.click(); assert.equal(calls,2); assert.equal(app.window.location.url,'/pagamento.html');
 });
-test('ambiguous provider failure checks status without issuing another creation when unresolved',async()=>{
+test('provider failure allows another creation attempt',async()=>{
   let calls=0; const app=setup(async(url,options)=>{
     if (!options) return {ok:true,json:async()=>({logradouro:'Praça da Sé',bairro:'Sé',localidade:'São Paulo',uf:'SP'})};
     calls++; if (url.endsWith('/status')) return {ok:false,status:404}; throw Error('offline');
   });
   await readyForPix(app); app.window.PIX_API_BASE_URL='https://pix.example.com'; await app.el('checkout-generate-pix').listeners.click(); await app.el('checkout-generate-pix').listeners.click();
-  assert.equal(calls,2); assert.match(app.el('checkout-payment-status').textContent,/não gere outra cobrança/i); assert.equal(app.window.location.url,undefined);
+  assert.equal(calls,2); assert.match(app.el('checkout-payment-status').textContent,/tente novamente/i); assert.equal(app.window.location.url,undefined);
 });
 test('requires bairro even if CEP does not provide it',async()=>{
   const app=setup(async()=>({ok:true,json:async()=>({logradouro:'Praça da Sé',bairro:'',localidade:'São Paulo',uf:'SP'})}));
@@ -132,16 +132,17 @@ test('rejects an incomplete PIX response without navigating or repeating the req
   });
   await readyForPix(app); app.window.PIX_API_BASE_URL='https://pix.example.com'; await app.el('checkout-generate-pix').listeners.click(); assert.match(app.el('checkout-payment-status').textContent,/validação da resposta/i); await app.el('checkout-generate-pix').listeners.click(); assert.equal(calls,2); assert.equal(app.window.location.url,undefined);
 });
-test('recovers a completed request using the same identifier without creating a second sale',async()=>{
-  const calls=[]; let create=0; const app=setup(async(url,options)=>{
+test('a retry after a failed request creates a new attempt',async()=>{
+  const calls=[]; let create=0, sequence=0; const app=setup(async(url,options)=>{
     if (!options) return {ok:true,json:async()=>({logradouro:'Praça da Sé',bairro:'Sé',localidade:'São Paulo',uf:'SP'})};
     const body=JSON.parse(options.body); calls.push({url,body});
     if (url.endsWith('/status')) return {ok:true,json:async()=>({status:'PENDING',amount:2299})};
     if (++create===1) throw Error('connection lost');
     return {ok:true,json:async()=>({transactionId:'TXN-1',status:'PENDING',amount:2299,paymentData:{copyPaste:'000201pix',qrCodeBase64:null,expiresAt:null}})};
   });
+  app.window.crypto.randomUUID=()=> sequence++ ? '123e4567-e89b-42d3-a456-426614174001' : '123e4567-e89b-42d3-a456-426614174000';
   await readyForPix(app); app.window.PIX_API_BASE_URL='https://pix.example.com'; await app.el('checkout-generate-pix').listeners.click(); await app.el('checkout-generate-pix').listeners.click();
-  assert.equal(calls.length,3); assert.equal(calls[0].body.requestId,calls[1].body.requestId); assert.equal(calls[0].body.requestId,calls[2].body.requestId); assert.match(calls[2].url,/\/api\/pix\/recover$/); assert.deepEqual(Object.keys(calls[2].body),['requestId']); assert.equal(app.window.location.url,'/pagamento.html'); assert.equal(JSON.parse(app.storage.get('checkout_payment_preview')).addressNeedsConfirmation,true);
+  assert.equal(calls.length,2); assert.notEqual(calls[0].body.requestId,calls[1].body.requestId); assert.match(calls[1].url,/\/api\/pix$/); assert.equal(app.window.location.url,'/pagamento.html');
 });
 test('oversized item instructions are rejected before a payment request',async()=>{
   let calls=0; const app=setup(async(url,options)=>{

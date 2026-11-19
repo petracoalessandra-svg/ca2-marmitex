@@ -1,0 +1,10 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {PixRequest} from './worker.mjs';
+
+const sale={amount:1490,externalRef:'b91c47d9-3284-4baa-981f-20e6150ce715',payer:{name:'Teste Local',email:'test@example.com',phone:'+5511999999999',taxId:'52998224725'},items:[{name:'Pão de Alho Caseiro',quantity:1,price:990,type:'PHYSICAL'},{name:'Mini Pudim',quantity:1,price:500,type:'PHYSICAL'}],delivery:{fee:0,address:{country:'BR',state:'SP',city:'São Paulo',district:'Sé',street:'Praça da Sé',number:'123',zipCode:'01001-000'}}};
+function setup(){const map=new Map();const storage={get:async k=>map.get(k),put:async(k,v)=>map.set(k,v),delete:async k=>map.delete(k),transaction:async fn=>fn(storage)};return new PixRequest({storage},{MASTERFY_API_KEY:'test'});}
+const call=object=>object.fetch(new Request('https://worker.internal/create',{method:'POST',body:JSON.stringify({sale})}));
+test('Masterfy response is converted to the storefront PIX contract',async()=>{const old=globalThis.fetch;let sent;globalThis.fetch=async(url,init)=>{sent=JSON.parse(init.body);return Response.json({id:'payment-id',amount:1490,method:'PIX',currency:'BRL',status:'PENDING',data:{method:'PIX',copypaste:'000201-test'}})};try{const r=await call(setup());assert.equal(r.status,201);assert.equal((await r.json()).paymentData.copyPaste,'000201-test');assert.equal(sent.amount,1490);assert.equal(sent.delivery.address.zipCode,'01001-000');}finally{globalThis.fetch=old;}});
+test('malformed Masterfy responses return only a field diagnostic',async()=>{const old=globalThis.fetch;globalThis.fetch=async()=>Response.json({id:'payment-id',amount:1490,method:'PIX',currency:'BRL',status:'PENDING',data:{method:'PIX'}});try{const r=await call(setup());assert.equal(r.status,502);assert.equal((await r.json()).code,'fields_111110');}finally{globalThis.fetch=old;}});
+test('invalid JSON is identified without exposing the upstream response',async()=>{const old=globalThis.fetch;globalThis.fetch=async()=>new Response('not json');try{const r=await call(setup());assert.equal((await r.json()).code,'invalid_json');}finally{globalThis.fetch=old;}});
